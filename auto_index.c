@@ -4,8 +4,9 @@
 
 #include "access/attnum.h"
 #include "access/htup_details.h"
-#include "catalog/pg_namespace.h"    /* ← fixes PG_CATALOG_NAMESPACE */
+#include "catalog/pg_namespace.h"  
 #include "catalog/pg_operator.h"
+#include "catalog/pg_statistic.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -25,16 +26,16 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/selfuncs.h"
 
 PG_MODULE_MAGIC;
 
 /* ----------------------------------------------------------------
- * Global state
+ Global state
  * ---------------------------------------------------------------- */
 
 AutoIndexSharedState *auto_index_state = NULL;
 
-/* Forward declarations — add these after the global variables */
 static void auto_index_shmem_request_hook(void);
 static void auto_index_shmem_startup_hook(void);
 static void auto_index_ExecutorRun(QueryDesc *queryDesc,
@@ -44,20 +45,14 @@ static void scan_for_equality_predicates(PlanState *planstate);
 static void process_seqscan_quals(SeqScanState *seqstate);
 static void record_scan(Oid relid, AttrNumber attno,
                         const char *relname, const char *attname,
-                        const char *nspname);
+                        const char *nspname,
+                        Relation rel);
 static bool is_equality_operator(Oid opno);
 
-
-/* Add this alongside prev_ExecutorRun */
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 
-/*
- * Fix for 'got_SIGTERM' undeclared:
- * In your Postgres version this flag is not exported.
- * We define our own and set it in a signal handler.
- */
 static volatile sig_atomic_t got_sigterm = false;
 
 static void
@@ -69,15 +64,10 @@ auto_index_sigterm(SIGNAL_ARGS)
     errno = save_errno;
 }
 
-/* Forward declarations */
 void        _PG_init(void);
 void        _PG_fini(void);
 
-/*
- * Fix for ExecutorRun_hook signature:
- * Your Postgres version uses 3 arguments (no execute_once).
- * Remove the 4th parameter.
- */
+
 static void auto_index_ExecutorRun(QueryDesc *queryDesc,
                                    ScanDirection direction,
                                    uint64 count);
@@ -86,15 +76,12 @@ static void scan_for_equality_predicates(PlanState *planstate);
 static void process_seqscan_quals(SeqScanState *seqstate);
 static void record_scan(Oid relid, AttrNumber attno,
                         const char *relname, const char *attname,
-                        const char *nspname);
+                        const char *nspname,
+                        Relation rel);
 static bool is_equality_operator(Oid opno);
 
 PGDLLEXPORT void auto_index_worker_main(Datum main_arg);
 
-
-/* ================================================================
- * SECTION 1: Shared Memory Setup
- * ================================================================ */
 
 static Size
 auto_index_shmem_size(void)
@@ -127,7 +114,7 @@ auto_index_shmem_startup(void)
 
 
 /* ================================================================
- * SECTION 2: Extension Initialization
+ Extension Initialization
  * ================================================================ */
 void
 _PG_init(void)
@@ -138,18 +125,15 @@ _PG_init(void)
         ereport(ERROR,
                 (errmsg("auto_index must be loaded via shared_preload_libraries")));
 
-    /* PG15+: memory requests MUST go through shmem_request_hook */
     prev_shmem_request_hook = shmem_request_hook;
     shmem_request_hook      = auto_index_shmem_request_hook;
 
     prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook      = auto_index_shmem_startup_hook;
 
-    /* Install executor hook */
     prev_ExecutorRun = ExecutorRun_hook;
     ExecutorRun_hook = auto_index_ExecutorRun;
 
-    /* Register background worker */
     MemSet(&worker, 0, sizeof(worker));
     worker.bgw_flags        = BGWORKER_SHMEM_ACCESS |
                               BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -172,17 +156,42 @@ _PG_fini(void)
 
 
 /* ================================================================
- * SECTION 3: Executor Hook — Predicate Detection
+ Executor Hook — Predicate Detection
  * ================================================================ */
-
-/*
- * 3-argument version — matches your Postgres version's hook type.
- */
 static void
 auto_index_ExecutorRun(QueryDesc *queryDesc,
                        ScanDirection direction,
-                       uint64 count)            /* ← no execute_once */
+                       uint64 count)            
 {
+    if (queryDesc->operation == CMD_INSERT ||
+    queryDesc->operation == CMD_UPDATE ||
+    queryDesc->operation == CMD_DELETE)
+{
+    PlanState *ps = queryDesc->planstate;
+
+    if (ps && IsA(ps, ModifyTableState))
+    {
+        ModifyTableState *mts = (ModifyTableState *) ps;
+        ResultRelInfo *rri = mts->resultRelInfo;
+
+        if (rri && rri->ri_RelationDesc)
+        {
+            Oid relid = RelationGetRelid(rri->ri_RelationDesc);
+
+            LWLockAcquire(&auto_index_state->lock.lock, LW_EXCLUSIVE);
+
+            for (int i = 0; i < auto_index_state->num_entries; i++)
+            {
+                ScanStat *entry = &auto_index_state->entries[i];
+
+                if (entry->relid == relid)
+                    entry->write_count++;
+            }
+
+            LWLockRelease(&auto_index_state->lock.lock);
+        }
+    }
+    }
     if (prev_ExecutorRun)
         prev_ExecutorRun(queryDesc, direction, count);
     else
@@ -198,7 +207,6 @@ scan_for_equality_predicates(PlanState *planstate)
     if (planstate == NULL)
         return;
 
-    /* Temporary debug — remove once confirmed working */
     elog(DEBUG1, "auto_index: visiting node type %d", nodeTag(planstate));
 
     if (IsA(planstate, SeqScanState))
@@ -273,7 +281,7 @@ process_seqscan_quals(SeqScanState *seqstate)
                     elog(LOG, "auto_index: detected scan on %s.%s col=%s opno=%u",
                          nspname, relname, attname, op->opno);
                     record_scan(relid, var->varattno,
-                                relname, attname, nspname);
+                                relname, attname, nspname, rel);
                 }
             }
         }
@@ -301,17 +309,18 @@ is_equality_operator(Oid opno)
 
 
 /* ================================================================
- * SECTION 4: Shared Memory Counter + Cost-Benefit Check
+ Shared Memory Counter + Cost-Benefit Check
  * ================================================================ */
 
 static void
 record_scan(Oid relid, AttrNumber attno,
             const char *relname, const char *attname,
-            const char *nspname)
+            const char *nspname, Relation rel)
 {
     AutoIndexSharedState *state = auto_index_state;
     ScanStat *entry = NULL;
     int       i;
+    double pages,seq_cost,index_cost,benefit_per_query,total_benefit,total_cost,total_rows;
 
     if (state == NULL)
         return;
@@ -340,6 +349,7 @@ record_scan(Oid relid, AttrNumber attno,
         entry->relid           = relid;
         entry->attno           = attno;
         entry->scan_count      = 0;
+        entry->write_count     = 0;
         entry->index_requested = false;
         entry->index_created   = false;
         strlcpy(entry->relname, relname, NAMEDATALEN);
@@ -348,22 +358,28 @@ record_scan(Oid relid, AttrNumber attno,
     }
 
     entry->scan_count++;
+    pages = RelationGetNumberOfBlocks(rel);
+    if(pages <= 0) pages = 1;
+    seq_cost = SEQ_SCAN_COST_PER_PAGE * pages;
+    index_cost = seq_cost * INDEX_SCAN_COST_FACTOR;
+    benefit_per_query = seq_cost - index_cost;
+    total_benefit = benefit_per_query * entry->scan_count;
+    total_cost = INDEX_CREATION_COST + (entry->write_count * INDEX_MAINTENANCE_COST);
+    total_rows = rel->rd_rel->reltuples;
+    if(total_rows <= 0) total_rows = 1000;
 
     if (!entry->index_requested &&
         !entry->index_created   &&
-        (INDEX_BENEFIT * entry->scan_count) > INDEX_CREATION_COST)
+        total_benefit > total_cost)
     {
         entry->index_requested = true;
-
-        /*
-         * Fix for %lld warning:
-         * int64 is 'long long' on macOS, so use INT64_FORMAT
-         * which Postgres defines as the correct format specifier.
-         */
         elog(LOG,
              "auto_index: threshold crossed for %s.%s.%s "
-             "(scans: " INT64_FORMAT ") — requesting index",
-             nspname, relname, attname, entry->scan_count);
+             "(benefit=%.2f cost=%.2f scans=" INT64_FORMAT " writes=" INT64_FORMAT ")",
+             nspname, relname, attname,
+             total_benefit, total_cost,
+             entry->scan_count,
+             entry->write_count);
     }
 
     LWLockRelease(&state->lock.lock);
@@ -371,7 +387,7 @@ record_scan(Oid relid, AttrNumber attno,
 
 
 /* ================================================================
- * SECTION 5: Background Worker
+ Background Worker
  * ================================================================ */
 void
 auto_index_worker_main(Datum main_arg)
@@ -379,16 +395,15 @@ auto_index_worker_main(Datum main_arg)
     pqsignal(SIGTERM, auto_index_sigterm);
     BackgroundWorkerUnblockSignals();
 
-    BackgroundWorkerInitializeConnection("postgres", "hp", 0);
+    BackgroundWorkerInitializeConnection("postgres", "aman_nehra", 0);
 
     elog(LOG, "auto_index background worker started");
 
-    /* THE MISSING WHILE LOOP IS BACK! */
     while (!got_sigterm)
     {
         int i;
 
-        /* Sleep for 5 seconds, waiting for latch or timeout */
+        // Sleep for 5 seconds, waiting for latch or timeout 
         WaitLatch(MyLatch,
                   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
                   5000L,
@@ -420,7 +435,7 @@ auto_index_worker_main(Datum main_arg)
                          entry->relname,
                          entry->attname);
 
-                /* Release shared lock before doing heavy SPI work */
+                // Release shared lock before doing heavy SPI work 
                 LWLockRelease(&auto_index_state->lock.lock);
 
                 PG_TRY();
@@ -449,7 +464,6 @@ auto_index_worker_main(Datum main_arg)
                 }
                 PG_CATCH();
                 {
-                    /* Safely handle SPI failures without crashing the worker */
                     EmitErrorReport();
                     FlushErrorState();
                     AbortCurrentTransaction();
@@ -463,7 +477,7 @@ auto_index_worker_main(Datum main_arg)
                 }
                 PG_END_TRY();
 
-                /* Re-acquire shared lock for the next loop iteration */
+                // Re-acquire shared lock for the next loop iteration 
                 LWLockAcquire(&auto_index_state->lock.lock, LW_SHARED);
             }
         }
@@ -484,7 +498,7 @@ auto_index_shmem_request_hook(void)
     if (prev_shmem_request_hook)
         prev_shmem_request_hook();
 
-    auto_index_shmem_request();   /* RequestAddinShmemSpace + LWLock */
+    auto_index_shmem_request();  
 }
 
 static void
@@ -493,5 +507,5 @@ auto_index_shmem_startup_hook(void)
     if (prev_shmem_startup_hook)
         prev_shmem_startup_hook();
 
-    auto_index_shmem_startup();   /* ShmemInitStruct */
+    auto_index_shmem_startup();
 }

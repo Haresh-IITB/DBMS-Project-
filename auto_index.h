@@ -2,19 +2,23 @@
 #define AUTO_INDEX_H
 
 #include "postgres.h"
-#include "access/attnum.h"       /* ← fixes 'unknown type AttrNumber' */
+#include "access/attnum.h"     
 #include "storage/lwlock.h"
 
+
+#define SEQ_SCAN_COST_PER_PAGE     1.0
+#define INDEX_SCAN_COST_FACTOR     0.2
+#define INDEX_CREATION_COST        1000.0
+#define INDEX_MAINTENANCE_COST     5.0
+#define SELECTIVITY_THRESHOLD  0.5
 #define MAX_TRACKED_ENTRIES   64
-#define SCAN_THRESHOLD        10
-#define INDEX_BENEFIT         100.0
-#define INDEX_CREATION_COST   10000.0
 
 typedef struct ScanStat
 {
     Oid         relid;
     AttrNumber  attno;
     int64       scan_count;
+    int64       write_count;
     bool        index_requested;
     bool        index_created;
     char        relname[NAMEDATALEN];
@@ -31,4 +35,4 @@ typedef struct AutoIndexSharedState
 
 extern AutoIndexSharedState *auto_index_state;
 
-#endif  /* AUTO_INDEX_H */
+#endif  
