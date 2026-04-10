@@ -28,7 +28,7 @@
 #include "utils/syscache.h"
 #include "utils/selfuncs.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC; 
 
 /* ----------------------------------------------------------------
  Global state
@@ -370,7 +370,8 @@ record_scan(Oid relid, AttrNumber attno,
 
     if (!entry->index_requested &&
         !entry->index_created   &&
-        total_benefit > total_cost)
+        total_benefit > total_cost &&
+        pages <= MAX_TABLE_PAGES) 
     {
         entry->index_requested = true;
         elog(LOG,

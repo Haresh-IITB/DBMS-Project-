@@ -13,6 +13,8 @@
 #define SELECTIVITY_THRESHOLD  0.5
 #define MAX_TRACKED_ENTRIES   64
 
+#define MAX_TABLE_PAGES 12800
+
 typedef struct ScanStat
 {
     Oid         relid;
