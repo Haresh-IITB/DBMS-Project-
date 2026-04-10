@@ -68,17 +68,7 @@ void        _PG_init(void);
 void        _PG_fini(void);
 
 
-static void auto_index_ExecutorRun(QueryDesc *queryDesc,
-                                   ScanDirection direction,
-                                   uint64 count);
 
-static void scan_for_equality_predicates(PlanState *planstate);
-static void process_seqscan_quals(SeqScanState *seqstate);
-static void record_scan(Oid relid, AttrNumber attno,
-                        const char *relname, const char *attname,
-                        const char *nspname,
-                        Relation rel);
-static bool is_equality_operator(Oid opno);
 
 PGDLLEXPORT void auto_index_worker_main(Datum main_arg);
 
