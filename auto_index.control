@@ -1,5 +1,4 @@
-# auto_index extension
-comment = 'Automatic index creation based on scan statistics'
+comment = 'Automatic index recommender / creator'
 default_version = '1.0'
-module_pathname = '$libdir/auto_index'
 relocatable = false
+superuser = true
