@@ -1,0 +1,27 @@
+DROP TABLE IF EXISTS orders;
+
+CREATE TABLE orders (
+    order_id INT,
+    customer_id INT,
+    status TEXT,
+    amount INT
+);
+
+
+INSERT INTO orders
+SELECT
+    i,
+    (i % 1000),   
+    CASE
+        WHEN i % 20 = 0 THEN 'FAILED'      
+        WHEN i % 5 = 0 THEN 'PENDING'      
+        ELSE 'COMPLETED'                  
+    END,
+    (random() * 1000)::INT
+FROM generate_series(1, 100000) AS i;
+
+ANALYZE orders;
+
+EXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'FAILED';
+
+INSERT INTO orders VALUES (999999, 1, 'FAILED', 100);

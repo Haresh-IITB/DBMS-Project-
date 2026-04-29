@@ -1,0 +1,17 @@
+./configure --prefix=$HOME/pg-install --enable-debug
+
+make -j$(nproc)
+
+make install
+
+export PATH=$HOME/pg-install/bin:$PATH
+
+sudo service postgresql stop
+
+pg_ctl -D $HOME/pg-data -l logfile start
+
+make clean ; make ; make install
+
+pg_ctl -D $HOME/pg-data restart
+
+psql -d postgres
