@@ -1,141 +1,134 @@
 --------------------------------------------------------------------
--- auto_index test workload
+-- auto_index v3 Complete Feature Test
 --
 -- Run with:
---     psql -d postgres -f test_workload.sql
+--     psql -U postgres -d postgres -f test_v3.sql
 --
--- Then watch the Postgres log (tail -F on the cluster's logfile).
--- Every interesting decision is prefixed with "auto_index:".
+-- Tail your logs in another terminal to watch the v3 math!
 --------------------------------------------------------------------
 
 \timing on
 SET client_min_messages = LOG;
 
 --------------------------------------------------------------------
--- 0. Reset
+-- 1. Setup & Data Generation
 --------------------------------------------------------------------
-DROP TABLE IF EXISTS orders;
+\echo '====[ 1. Generating Skewed Test Data ]===='
+DROP TABLE IF EXISTS user_logs;
 
-CREATE TABLE orders (
-    order_id     INT,
-    customer_id  INT,
-    status       TEXT,
-    amount       INT,
-    created_at   DATE
+CREATE TABLE user_logs (
+    log_id      SERIAL PRIMARY KEY,
+    user_id     INT,
+    action      TEXT,
+    created_at  TIMESTAMP DEFAULT now()
 );
 
-INSERT INTO orders
-SELECT
-    i,
-    (i % 1000),
-    CASE
-        WHEN i % 20 = 0 THEN 'FAILED'
-        WHEN i %  5 = 0 THEN 'PENDING'
-        ELSE 'COMPLETED'
+-- Insert 100,000 rows. 
+-- user_id uses power(random(), 3) so low IDs are common, high IDs are rare.
+-- action is mostly 'LOGIN', but rarely 'FAILED'.
+INSERT INTO user_logs (user_id, action, created_at)
+SELECT 
+    (power(random(), 3) * 10000)::INT, 
+    CASE 
+        WHEN random() < 0.05 THEN 'FAILED'
+        WHEN random() < 0.20 THEN 'LOGOUT'
+        ELSE 'LOGIN'
     END,
-    (random() * 1000)::INT,
-    DATE '2024-01-01' + ((i % 365) || ' days')::INTERVAL
-FROM generate_series(1, 100000) AS i;
+    now() - (random() * 100 || ' days')::interval
+FROM generate_series(1, 100000);
 
-ANALYZE orders;
+ANALYZE user_logs;
 
---------------------------------------------------------------------
--- 1. Equality predicate (Phase 1: classify '=' as OP_EQ)
---    Run several times so the per-shape observation_count grows
---    enough that benefit can plausibly cover index creation cost.
---------------------------------------------------------------------
-\echo '====[ 1. EQUALITY workload ]===='
-
-SELECT count(*) FROM orders WHERE status = 'FAILED';
-SELECT count(*) FROM orders WHERE status = 'FAILED';
-SELECT count(*) FROM orders WHERE status = 'FAILED';
-SELECT count(*) FROM orders WHERE status = 'FAILED';
-SELECT count(*) FROM orders WHERE status = 'FAILED';
 
 --------------------------------------------------------------------
--- 2. Range predicate (Phase 1: <, >; Phase 1: collapse_range_pairs)
+-- 2. Single Attribute Index Test
 --------------------------------------------------------------------
-\echo '====[ 2. RANGE workload ]===='
+\echo '====[ 2. Single Attribute Test ]===='
+\echo 'Querying ONLY user_id. The extension should evaluate a single-column'
+\echo 'candidate and propose a singleton index.'
 
-SELECT count(*) FROM orders WHERE amount > 800;
-SELECT count(*) FROM orders WHERE amount > 800;
-SELECT count(*) FROM orders WHERE amount BETWEEN 100 AND 200;
-SELECT count(*) FROM orders WHERE amount BETWEEN 100 AND 200;
-SELECT count(*) FROM orders WHERE amount BETWEEN 100 AND 200;
+SELECT count(*) FROM user_logs WHERE 9999 = user_id;
+SELECT count(*) FROM user_logs WHERE 9999 = user_id;
+SELECT count(*) FROM user_logs WHERE 9999 = user_id;
+SELECT count(*) FROM user_logs WHERE 9999 = user_id;
+SELECT count(*) FROM user_logs WHERE 9999 = user_id;
 
---------------------------------------------------------------------
--- 3. IN-list (Phase 1: ScalarArrayOpExpr)
---------------------------------------------------------------------
-\echo '====[ 3. IN-list workload ]===='
+\echo 'Waiting 6 seconds for BgWorker to build the user_id index...'
+SELECT pg_sleep(6);
 
-SELECT count(*) FROM orders WHERE customer_id IN (1, 2, 3, 4, 5);
-SELECT count(*) FROM orders WHERE customer_id IN (1, 2, 3, 4, 5);
-SELECT count(*) FROM orders WHERE customer_id IN (1, 2, 3, 4, 5);
 
 --------------------------------------------------------------------
--- 4. Multi-column conjunction (Phase 3: composite vs singleton)
---    The multi-col candidate (status, customer_id) should win once
---    this shape recurs enough.
+-- 3. Composite Index Test
 --------------------------------------------------------------------
-\echo '====[ 4. MULTI-COLUMN workload ]===='
+\echo '====[ 3. Composite Attribute Test ]===='
+\echo 'Querying action AND created_at (neither has an index yet).'
+\echo 'It should evaluate cand(action), cand(created_at), and cand(action, created_at).'
 
-SELECT count(*) FROM orders WHERE status = 'PENDING' AND customer_id = 42;
-SELECT count(*) FROM orders WHERE status = 'PENDING' AND customer_id = 42;
-SELECT count(*) FROM orders WHERE status = 'PENDING' AND customer_id = 42;
-SELECT count(*) FROM orders WHERE status = 'PENDING' AND customer_id = 99;
-SELECT count(*) FROM orders WHERE status = 'PENDING' AND customer_id = 99;
+SELECT count(*) FROM user_logs WHERE action = 'FAILED' AND created_at > now() - INTERVAL '10 days';
+SELECT count(*) FROM user_logs WHERE action = 'FAILED' AND created_at > now() - INTERVAL '10 days';
+SELECT count(*) FROM user_logs WHERE action = 'FAILED' AND created_at > now() - INTERVAL '10 days';
+SELECT count(*) FROM user_logs WHERE action = 'FAILED' AND created_at > now() - INTERVAL '10 days';
+SELECT count(*) FROM user_logs WHERE action = 'FAILED' AND created_at > now() - INTERVAL '10 days';
 
---------------------------------------------------------------------
--- 5. Mixed equality + range (Phase 3: equality column should be
---    placed FIRST in the composite index)
---------------------------------------------------------------------
-\echo '====[ 5. EQ + RANGE workload ]===='
+\echo 'Waiting 6 seconds for BgWorker to build the composite index...'
+SELECT pg_sleep(6);
 
-SELECT count(*) FROM orders WHERE status = 'FAILED' AND amount > 500;
-SELECT count(*) FROM orders WHERE status = 'FAILED' AND amount > 500;
-SELECT count(*) FROM orders WHERE status = 'FAILED' AND amount > 500;
 
 --------------------------------------------------------------------
--- 6. Wait for the bgworker to actually run CREATE INDEX
---    (poll loop wakes every 5s; sleep a bit longer to be safe)
+-- 4. Write Overhead Test
 --------------------------------------------------------------------
-\echo '====[ 6. Sleep to let bgworker create indexes ]===='
-SELECT pg_sleep(8);
+\echo '====[ 4. Write Overhead Test ]===='
+\echo 'Writing 100,000 new rows to drive up r->write_count.'
+\echo 'This drastically increases the write_overhead surcharge for future indexes.'
+
+INSERT INTO user_logs (user_id, action)
+SELECT (random() * 10000)::INT, 'LOGIN'
+FROM generate_series(1, 100000);
+
 
 --------------------------------------------------------------------
--- 7. Inspect what got created
+-- 5. Test Reads with High Write Penalty
 --------------------------------------------------------------------
-\echo '====[ 7. Indexes auto_index actually created ]===='
-SELECT indexname, indexdef
-  FROM pg_indexes
- WHERE tablename = 'orders'
-   AND indexname LIKE 'auto_idx%'
- ORDER BY indexname;
+\echo '====[ 5. Read Test (High Write Penalty) ]===='
+\echo 'Querying the "action" column alone.'
+\echo 'Watch your logs for "wr_overhead=" and "total_cost=". The net_benefit'
+\echo 'might be negative due to the massive write penalty we just triggered!'
+
+SELECT count(*) FROM user_logs WHERE action = 'LOGOUT';
+SELECT count(*) FROM user_logs WHERE action = 'LOGOUT';
+SELECT count(*) FROM user_logs WHERE action = 'LOGOUT';
+SELECT count(*) FROM user_logs WHERE action = 'LOGOUT';
+SELECT count(*) FROM user_logs WHERE action = 'LOGOUT';
+
 
 --------------------------------------------------------------------
--- 8. Show that the planner now picks them
+-- 6. Existing Index Detection Test
 --------------------------------------------------------------------
-\echo '====[ 8. EXPLAIN: should now use the auto-created index ]===='
-EXPLAIN SELECT * FROM orders WHERE status = 'FAILED';
-EXPLAIN SELECT * FROM orders WHERE status = 'PENDING' AND customer_id = 42;
+\echo '====[ 6. Existing Index Detection Test ]===='
+\echo 'We already have a singleton on user_id (from step 2).'
+\echo 'Let us run a multi-column query using user_id and action.'
+\echo 'Because the existing user_id index is so selective, best_existing_cost'
+\echo 'will beat the cost of creating a brand new composite index.'
+
+SELECT count(*) FROM user_logs WHERE user_id = 9999 AND action = 'FAILED';
+SELECT count(*) FROM user_logs WHERE user_id = 9999 AND action = 'FAILED';
+SELECT count(*) FROM user_logs WHERE user_id = 9999 AND action = 'FAILED';
+
 
 --------------------------------------------------------------------
--- 9. Heavy write workload to demonstrate maintenance-cost weighting
---    (write_count goes up; subsequent re-evaluations should treat
---     new candidates as more expensive)
+-- 7. Print All Indexes
 --------------------------------------------------------------------
-\echo '====[ 9. WRITE-heavy workload to bump maintenance cost ]===='
-INSERT INTO orders
-SELECT
-    100000 + i, (i % 1000), 'COMPLETED', (random() * 1000)::INT,
-    DATE '2024-06-01'
-FROM generate_series(1, 50) AS i;
+\echo ' '
+\echo '====[ FINAL: Printing all indexes on the database ]===='
+\echo ' '
 
--- A new column predicate after many writes -- should show much higher
--- maint_cost in the LOG line.
-SELECT count(*) FROM orders WHERE created_at = DATE '2024-06-01';
-SELECT count(*) FROM orders WHERE created_at = DATE '2024-06-01';
-SELECT count(*) FROM orders WHERE created_at = DATE '2024-06-01';
-SELECT count(*) FROM orders WHERE created_at = DATE '2024-06-01';
+SELECT 
+    schemaname, 
+    tablename, 
+    indexname, 
+    indexdef
+FROM pg_indexes
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY tablename, indexname;
 
-\echo '====[ DONE - check the logs and the indexes table above ]===='
+\echo '====[ DONE ]===='

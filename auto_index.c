@@ -1,28 +1,37 @@
 /* ================================================================
- * auto_index.c
+ * auto_index.c - v3
  *
  * Automatic index creation extension for PostgreSQL.
  *
- * Sections / phases (matches the agreed plan):
+ * Sections / phases:
  *
- *   Phase 0  Per-relation tracking with predicate / shape sub-arrays
+ *   Phase 0  Per-relation tracking (predicates, shapes, existing
+ *            indexes, created indexes)
  *   Phase 1  Generalized operator detection (=, <, <=, >, >=, IN,
- *            range pairs) via the pg_amop catalog
- *   Phase 2  Cost model derived from PostgreSQL's own planner GUCs
- *            (seq_page_cost / random_page_cost / cpu_*_cost) plus
- *            selectivity from pg_statistic
- *   Phase 3  Multi-column candidate generation with B-tree column
- *            ordering (equality first, then by selectivity)
- *   Phase 4  Cross-shape benefit accounting + dedup against indexes
- *            we have already created
+ *            range pairs) via pg_amop.  Var-on-right correctly
+ *            flips the strategy.  Var op Var accepted when one
+ *            Var is on the scan's relation (join case).
+ *   Phase 2  Selectivity from pg_statistic histograms / MCV / min-
+ *            max (chapter 16.39 / 16.41).  Cost model uses the
+ *            planner GUCs (seq_page_cost / random_page_cost / ...).
+ *   Phase 3  Multi-column candidates with B-tree column ordering.
+ *            Candidate-vs-shape match uses prefix-length, not full
+ *            shape inclusion -- so an index on (a,b) correctly
+ *            serves a shape {a, b, c} (with c becoming a residual
+ *            filter) and is correctly truncated by a non-equality
+ *            predicate on a leading column.
+ *   Phase 4  Cross-shape benefit accounting.  Each candidate is
+ *            scored against every recorded shape on the relation
+ *            AND against every existing real index on the relation
+ *            (read from pg_index): benefit is counted only when
+ *            the candidate beats the best existing option.  Write
+ *            cost uses the pganalyze "Index Write Overhead" ratio
+ *            applied as a surcharge to one-time creation cost.
  *
  * Logging:
- *   - elog(LOG, ...) is used for every meaningful decision so the
- *     extension's behaviour can be followed by tailing the postmaster
- *     log.  All such lines start with "auto_index:" so they are easy
- *     to grep for.
- *   - elog(DEBUG1, ...) is used for finer trace; enable with
- *     SET client_min_messages = DEBUG1 (or log_min_messages).
+ *   - elog(LOG, ...) for every meaningful decision.  Lines start
+ *     with "auto_index:" so they are easy to grep for.
+ *   - elog(DEBUG1, ...) for fine-grained tracing.
  * ================================================================ */
 
 #include "postgres.h"
@@ -33,6 +42,7 @@
 
 #include "access/attnum.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "access/stratnum.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
@@ -58,12 +68,15 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 #include "optimizer/optimizer.h"
 
 PG_MODULE_MAGIC;
+
 
 /* ================================================================
  *  Globals & forward declarations
@@ -77,14 +90,12 @@ static ExecutorRun_hook_type   prev_ExecutorRun        = NULL;
 
 static volatile sig_atomic_t got_sigterm = false;
 
-/* shared-memory plumbing */
 static void  auto_index_shmem_request_hook(void);
 static void  auto_index_shmem_startup_hook(void);
 static void  auto_index_shmem_request(void);
 static void  auto_index_shmem_startup(void);
 static Size  auto_index_shmem_size(void);
 
-/* executor hook + plan walker */
 static void  auto_index_ExecutorRun(QueryDesc *queryDesc,
                                     ScanDirection direction,
                                     uint64 count);
@@ -92,29 +103,37 @@ static void  walk_plan_tree(PlanState *planstate);
 static void  process_seqscan_node(SeqScanState *seqstate);
 static void  bump_writes_for_modify(QueryDesc *queryDesc);
 
-/* phase 1: operator classification */
 static OpStrategy classify_btree_operator(Oid opno);
+static OpStrategy flip_strategy(OpStrategy s);
 static const char *opstrategy_name(OpStrategy s);
 
-/* phase 2: selectivity + cost */
-static double   estimate_eq_selectivity(Oid relid, AttrNumber attno);
-static double   estimate_ineq_selectivity(OpStrategy s);
-static double   estimate_index_height(double reltuples, int avg_width);
-static double   estimate_seqscan_cost(BlockNumber relpages, double reltuples);
-static double   cost_index_scan(double n_matching, double height);
-static double   cost_index_creation(BlockNumber relpages);
-static double   cost_per_write_maint(double height);
+/* selectivity */
+static int    get_column_avg_width(Oid relid, AttrNumber attno);
+static int    compute_relation_row_size(Relation rel);
+static double get_n_distinct(Form_pg_statistic stats, double ntuples);
+static double selectivity_from_pg_stats(Oid relid, AttrNumber attno,
+                                        OpStrategy s,
+                                        Datum value, bool has_value,
+                                        Oid value_type, Oid collation);
 
-/* phase 0: shared-state mutation helpers */
+/* cost */
+static double estimate_index_height(double reltuples, int avg_width);
+static double estimate_seqscan_cost(BlockNumber relpages, double reltuples);
+static double cost_index_scan(double n_matching, double height);
+static double cost_index_creation(BlockNumber relpages);
+
+/* shared-state helpers */
 static RelStat       *find_or_create_relstat(Oid relid,
                                              const char *relname,
                                              const char *nspname,
                                              BlockNumber relpages,
                                              double reltuples,
-                                             int avg_width);
+                                             int avg_width,
+                                             int row_size);
 static PredicateInfo *find_or_create_predicate(RelStat *r,
                                                AttrNumber attno,
                                                OpStrategy s,
+                                               int attwidth,
                                                const char *attname);
 static void           upsert_scan_shape(RelStat *r,
                                         int n,
@@ -122,34 +141,46 @@ static void           upsert_scan_shape(RelStat *r,
                                         OpStrategy *strats,
                                         double *sels);
 
-/* phase 3 + 4: candidate generation, scoring, selection */
+/* existing indexes */
+static int    enumerate_existing_indexes(Relation rel,
+                                         ExistingIndexInfo *out, int max_out);
+
+/* candidate generation, scoring, selection */
 typedef struct IndexCandidate
 {
     int         num_cols;
     AttrNumber  attnos[MAX_SHAPE_COLS];
     OpStrategy  strategies[MAX_SHAPE_COLS];
     double      selectivities[MAX_SHAPE_COLS];
+    int         attwidths[MAX_SHAPE_COLS];      /* per-col avg byte width */
     char        attnames[MAX_SHAPE_COLS][NAMEDATALEN];
     char        key_str[MAX_INDEX_KEY_STR];
 
-    /* scoring outputs */
     double      total_benefit;
-    double      maint_cost;
     double      creation_cost;
+    double      per_write_cost;        /* was write_overhead   */
+    double      total_cost;            /* creation + per_write × write_count */
     double      net_benefit;
     int         shapes_covered;
 } IndexCandidate;
 
 #define MAX_LOCAL_CANDIDATES 64
 
-static int    build_candidates(RelStat *r,
-                               IndexCandidate *out, int max_out);
-static void   sort_candidate_columns(IndexCandidate *c);
-static void   serialize_candidate_key(IndexCandidate *c);
-static bool   candidate_already_created(RelStat *r, IndexCandidate *c);
-static bool   candidate_can_serve_shape(IndexCandidate *c, ScanShape *s);
-static void   score_candidate(IndexCandidate *c, RelStat *r);
-static void   evaluate_and_propose(RelStat *r);
+static int  build_candidates(RelStat *r,
+                             IndexCandidate *out, int max_out);
+static void sort_candidate_columns(IndexCandidate *c);
+static void serialize_candidate_key(IndexCandidate *c);
+static bool candidate_already_exists(RelStat *r, IndexCandidate *c);
+static int  prefix_length_for_shape(AttrNumber *idx_attnos,
+                                    int idx_ncols,
+                                    ScanShape *s,
+                                    double *out_eff_sel);
+static double cost_for_index_on_shape(AttrNumber *attnos, int ncols,
+                                      RelStat *r, ScanShape *s,
+                                      double height);
+static double compute_per_write_cost(IndexCandidate *c, RelStat *r);
+static void score_candidate(IndexCandidate *c, RelStat *r);
+static void evaluate_and_propose(RelStat *r);
 
 /* bgworker */
 void          _PG_init(void);
@@ -191,9 +222,11 @@ auto_index_shmem_startup(void)
         auto_index_state->num_entries = 0;
         elog(LOG, "auto_index: shared state initialized "
                   "(MAX_TRACKED_ENTRIES=%d, MAX_PREDICATES_PER_REL=%d, "
-                  "MAX_SHAPES_PER_REL=%d, total_size=%zu bytes)",
+                  "MAX_SHAPES_PER_REL=%d, MAX_EXISTING_INDEXES_PER_REL=%d, "
+                  "total_size=%zu bytes)",
              MAX_TRACKED_ENTRIES, MAX_PREDICATES_PER_REL,
-             MAX_SHAPES_PER_REL, auto_index_shmem_size());
+             MAX_SHAPES_PER_REL, MAX_EXISTING_INDEXES_PER_REL,
+             auto_index_shmem_size());
     }
 }
 
@@ -262,11 +295,6 @@ _PG_fini(void)
 
 /* ================================================================
  *  Phase 1 - operator classification
- *
- *  We look the operator up in pg_amop and ask: does any B-tree
- *  operator class contain it, and if so, with which strategy
- *  number?  This is the same lookup the planner uses, so we accept
- *  exactly the operators that B-tree can index.
  * ================================================================ */
 
 static OpStrategy
@@ -299,7 +327,6 @@ classify_btree_operator(Oid opno)
     }
     ReleaseSysCacheList(list);
 
-    /* PostgreSQL has no btree strategy for <>; detect by oprname. */
     if (result == OP_NONE)
     {
         HeapTuple tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
@@ -313,6 +340,23 @@ classify_btree_operator(Oid opno)
     }
 
     return result;
+}
+
+/*
+ * If a predicate looks like "Const op Var" instead of "Var op Const",
+ * the operator's semantics are reversed: 5 < x is x > 5.
+ */
+static OpStrategy
+flip_strategy(OpStrategy s)
+{
+    switch (s)
+    {
+        case OP_LT: return OP_GT;
+        case OP_LE: return OP_GE;
+        case OP_GT: return OP_LT;
+        case OP_GE: return OP_LE;
+        default:    return s;       /* EQ, NE, RANGE, NONE: unchanged */
+    }
 }
 
 static const char *
@@ -333,67 +377,298 @@ opstrategy_name(OpStrategy s)
 
 
 /* ================================================================
- *  Phase 2 - selectivity + cost model
- *
- *  Selectivity comes from pg_statistic (n_distinct for equality,
- *  PostgreSQL planner defaults for inequalities and ranges).  All
- *  costs are expressed in the planner's native units (multiples of
- *  seq_page_cost) so they remain meaningful regardless of how the
- *  DBA tuned the GUCs for the underlying storage.
+ *  Phase 2 - selectivity & column-width helpers
  * ================================================================ */
 
-static double
-estimate_eq_selectivity(Oid relid, AttrNumber attno)
+/*
+ * Average byte width for one column.  Falls back to typlen for fixed
+ * types or 16 for variable-length when no pg_statistic row exists yet.
+ */
+static int
+get_column_avg_width(Oid relid, AttrNumber attno)
 {
-    HeapTuple   tp;
-    double      sel = DEFAULT_EQ_SEL;     /* 0.005, planner default */
+    HeapTuple   stp;
+    int         width = 0;
 
-    tp = SearchSysCache3(STATRELATTINH,
-                         ObjectIdGetDatum(relid),
-                         Int16GetDatum(attno),
-                         BoolGetDatum(false));
-    if (HeapTupleIsValid(tp))
+    stp = SearchSysCache3(STATRELATTINH,
+                          ObjectIdGetDatum(relid),
+                          Int16GetDatum(attno),
+                          BoolGetDatum(false));
+    if (HeapTupleIsValid(stp))
     {
-        Form_pg_statistic stats = (Form_pg_statistic) GETSTRUCT(tp);
-        double            n_distinct = stats->stadistinct;
-
-        if (n_distinct > 0)
-            sel = 1.0 / n_distinct;
-        else if (n_distinct < 0)
-            sel = -n_distinct;            /* fraction of distinct rows */
-        /* if n_distinct == 0 we leave the planner default in place    */
-
-        ReleaseSysCache(tp);
+        Form_pg_statistic stats = (Form_pg_statistic) GETSTRUCT(stp);
+        width = stats->stawidth;
+        ReleaseSysCache(stp);
     }
-    if (sel <= 0.0) sel = DEFAULT_EQ_SEL;
-    if (sel >  1.0) sel = 1.0;
-    return sel;
-}
 
-static double
-estimate_ineq_selectivity(OpStrategy s)
-{
-    /*
-     * We don't try to read histograms here -- for the cost model the
-     * planner's own defaults give us a sensible mid-range estimate.
-     */
-    switch (s)
+    if (width <= 0)
     {
-        case OP_LT:
-        case OP_LE:
-        case OP_GT:
-        case OP_GE:    return DEFAULT_INEQ_SEL;          /* 1/3   */
-        case OP_RANGE: return DEFAULT_RANGE_INEQ_SEL;    /* 0.005 */
-        case OP_NE:    return 1.0 - DEFAULT_EQ_SEL;
-        default:       return 0.1;
+        Oid     atttypid;
+        HeapTuple atp;
+
+        atp = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid),
+                              Int16GetDatum(attno));
+        if (HeapTupleIsValid(atp))
+        {
+            Form_pg_attribute att = (Form_pg_attribute) GETSTRUCT(atp);
+            atttypid = att->atttypid;
+            ReleaseSysCache(atp);
+
+            {
+                int16   typlen;
+                bool    typbyval;
+                get_typlenbyval(atttypid, &typlen, &typbyval);
+                if (typlen > 0) width = typlen;
+                else            width = 16;     /* generic guess */
+            }
+        }
+        else
+        {
+            width = 16;
+        }
     }
+    return width;
 }
 
 /*
- * Estimate B-tree height as ceil(log_F(N_leaf)) with fanout F = 100.
- * N_leaf is approximated from reltuples and average key width.
- * Returns a value >= 1.
+ * Per pganalyze's "Index Write Overhead" doc:
+ *      row size = 23 (tuple header) + 4 (item ptr)
+ *               + Sum(avg_width of all (non-dropped) columns)
  */
+static int
+compute_relation_row_size(Relation rel)
+{
+    TupleDesc   tupdesc = RelationGetDescr(rel);
+    Oid         relid   = RelationGetRelid(rel);
+    int         total   = 23 + 4;
+    int         i;
+
+    for (i = 0; i < tupdesc->natts; i++)
+    {
+        Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+        if (att->attisdropped)
+            continue;
+        total += get_column_avg_width(relid, att->attnum);
+    }
+    return total;
+}
+
+/*
+ * Resolve pg_statistic.stadistinct to an absolute distinct-count.
+ *      > 0 : absolute
+ *      < 0 : fraction of ntuples (so n_distinct = -stadistinct * ntuples)
+ *      = 0 : unknown -> caller must fall back
+ */
+static double
+get_n_distinct(Form_pg_statistic stats, double ntuples)
+{
+    if (stats->stadistinct > 0.0)
+        return stats->stadistinct;
+    if (stats->stadistinct < 0.0 && ntuples > 0)
+        return -stats->stadistinct * ntuples;
+    return -1.0;
+}
+
+/*
+ * Selectivity for one (column, op, value) triple, derived from
+ * pg_statistic per chapter 16.39 / 16.41.
+ *
+ * Strategy:
+ *   1. Equality + value present:
+ *        a. Try MCV list (STATISTIC_KIND_MCV) - exact match wins.
+ *        b. Otherwise (1 - sum_mcv) / (n_distinct - n_mcv).
+ *   2. Equality without value:
+ *        Per-column average  =  1 / n_distinct.
+ *   3. Inequality (LT/LE/GT/GE) + value present:
+ *        Histogram (STATISTIC_KIND_HISTOGRAM) bucket interpolation
+ *        per slide 16.41.  No subtraction needed: bucket midpoint.
+ *   4. Inequality without value:
+ *        Planner default DEFAULT_INEQ_SEL.
+ *   5. RANGE:  DEFAULT_RANGE_INEQ_SEL  (slide 16.42 approximation).
+ *   6. Anything else, or no stats:  hard-coded planner defaults.
+ *
+ * Returns a value in (0, 1].
+ */
+static double
+selectivity_from_pg_stats(Oid relid, AttrNumber attno, OpStrategy s,
+                          Datum value, bool has_value,
+                          Oid value_type, Oid collation)
+{
+    HeapTuple   stp;
+    Form_pg_statistic stats;
+    double      sel = -1.0;
+    double      ntuples = 0.0;
+    const char *source = "default";
+
+    /* sane defaults if we never reach pg_statistic */
+    double      default_sel;
+    if (s == OP_EQ)
+        default_sel = DEFAULT_EQ_SEL;
+    else if (s == OP_RANGE)
+        default_sel = DEFAULT_RANGE_INEQ_SEL;
+    else if (s == OP_NE)
+        default_sel = 1.0 - DEFAULT_EQ_SEL;
+    else
+        default_sel = DEFAULT_INEQ_SEL;
+
+    stp = SearchSysCache3(STATRELATTINH,
+                          ObjectIdGetDatum(relid),
+                          Int16GetDatum(attno),
+                          BoolGetDatum(false));
+    if (!HeapTupleIsValid(stp))
+    {
+        elog(DEBUG1, "auto_index: no pg_statistic row for relid=%u attno=%d "
+                     "(table not ANALYZE'd?), using default sel=%.4f",
+             relid, attno, default_sel);
+        return default_sel;
+    }
+    stats = (Form_pg_statistic) GETSTRUCT(stp);
+
+    /* fetch ntuples too -- needed for n_distinct conversion */
+    {
+        HeapTuple ctp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+        if (HeapTupleIsValid(ctp))
+        {
+            Form_pg_class cf = (Form_pg_class) GETSTRUCT(ctp);
+            ntuples = cf->reltuples;
+            ReleaseSysCache(ctp);
+        }
+    }
+
+    /* ---- Equality with value: try MCV ---- */
+    if (s == OP_EQ && has_value && OidIsValid(value_type))
+    {
+        AttStatsSlot mcv;
+
+        if (get_attstatsslot(&mcv, stp,
+                             STATISTIC_KIND_MCV, InvalidOid,
+                             ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
+        {
+            TypeCacheEntry *tce = lookup_type_cache(value_type,
+                                          TYPECACHE_EQ_OPR_FINFO);
+            if (OidIsValid(tce->eq_opr_finfo.fn_oid))
+            {
+                int i;
+                for (i = 0; i < mcv.nvalues && i < mcv.nnumbers; i++)
+                {
+                    bool eq = DatumGetBool(
+                        FunctionCall2Coll(&tce->eq_opr_finfo,
+                                          collation,
+                                          value, mcv.values[i]));
+                    if (eq)
+                    {
+                        sel = mcv.numbers[i];
+                        source = "MCV-hit";
+                        break;
+                    }
+                }
+            }
+            free_attstatsslot(&mcv);
+        }
+    }
+
+    /* ---- Equality fallback: (1-sumMCV) / (nd - nMCV) ---- */
+    if (s == OP_EQ && sel < 0.0)
+    {
+        double  nd = get_n_distinct(stats, ntuples);
+        double  sum_mcv = 0.0;
+        int     n_mcv   = 0;
+        AttStatsSlot mcv;
+
+        if (get_attstatsslot(&mcv, stp,
+                             STATISTIC_KIND_MCV, InvalidOid,
+                             ATTSTATSSLOT_NUMBERS))
+        {
+            int i;
+            for (i = 0; i < mcv.nnumbers; i++)
+                sum_mcv += mcv.numbers[i];
+            n_mcv = mcv.nnumbers;
+            free_attstatsslot(&mcv);
+        }
+
+        if (nd > 0)
+        {
+            double  remaining_distinct = nd - (double) n_mcv;
+            if (remaining_distinct < 1.0) remaining_distinct = 1.0;
+            sel = (1.0 - sum_mcv) / remaining_distinct;
+            source = (n_mcv > 0) ? "1/(nd-mcv)" : "1/n_distinct";
+        }
+    }
+
+    /* ---- Inequality with value: histogram bucket interpolation ---- */
+    if ((s == OP_LT || s == OP_LE || s == OP_GT || s == OP_GE)
+        && has_value && OidIsValid(value_type) && sel < 0.0)
+    {
+        AttStatsSlot hist;
+
+        if (get_attstatsslot(&hist, stp,
+                             STATISTIC_KIND_HISTOGRAM, InvalidOid,
+                             ATTSTATSSLOT_VALUES))
+        {
+            if (hist.nvalues >= 2)
+            {
+                TypeCacheEntry *tce = lookup_type_cache(value_type,
+                                            TYPECACHE_CMP_PROC_FINFO);
+                if (OidIsValid(tce->cmp_proc_finfo.fn_oid))
+                {
+                    int n = hist.nvalues;
+                    int low = 0, high = n - 1;
+                    double frac_le_v = 0.5;     /* default: middle */
+                    int32 cmp;
+
+                    /* binary search: smallest i with hist[i] >= v */
+                    while (low < high)
+                    {
+                        int mid = (low + high) / 2;
+                        cmp = DatumGetInt32(
+                            FunctionCall2Coll(&tce->cmp_proc_finfo,
+                                              collation,
+                                              hist.values[mid], value));
+                        if (cmp < 0) low = mid + 1;
+                        else         high = mid;
+                    }
+                    cmp = DatumGetInt32(
+                        FunctionCall2Coll(&tce->cmp_proc_finfo, collation,
+                                          hist.values[low], value));
+
+                    if (cmp < 0)
+                        frac_le_v = 1.0;                /* v > all */
+                    else if (cmp == 0)
+                        frac_le_v = (double) low / (double)(n - 1);
+                    else if (low == 0)
+                        frac_le_v = 0.0;                /* v < all */
+                    else
+                        frac_le_v = ((double) low - 0.5) / (double)(n - 1);
+
+                    if (s == OP_LT || s == OP_LE)
+                        sel = frac_le_v;
+                    else
+                        sel = 1.0 - frac_le_v;
+                    source = "histogram";
+                }
+            }
+            free_attstatsslot(&hist);
+        }
+    }
+
+    ReleaseSysCache(stp);
+
+    if (sel < 0.0)
+        sel = default_sel;
+    if (sel <= 0.0) sel = 1e-9;
+    if (sel >  1.0) sel = 1.0;
+
+    elog(DEBUG1, "auto_index: sel(relid=%u attno=%d op=%s)=%.5f source=%s",
+         relid, attno, opstrategy_name(s), sel, source);
+
+    return sel;
+}
+
+
+/* ================================================================
+ *  Cost helpers (PG-units, planner GUCs)
+ * ================================================================ */
+
 static double
 estimate_index_height(double reltuples, int avg_width)
 {
@@ -405,7 +680,6 @@ estimate_index_height(double reltuples, int avg_width)
     if (reltuples <= 0) reltuples = 1.0;
     if (avg_width <= 0) avg_width = 8;
 
-    /* index tuple header (~6) + key + ItemIdData (~4) */
     per_tuple_bytes = (double) avg_width + 16.0;
     leaf_pages = ceil((reltuples * per_tuple_bytes) / (double) BLCKSZ);
     if (leaf_pages < 1.0) leaf_pages = 1.0;
@@ -415,11 +689,6 @@ estimate_index_height(double reltuples, int avg_width)
     return height;
 }
 
-/*
- * Sequential scan cost (slide A1, in PG units):
- *     seq_page_cost * relpages + (cpu_tuple_cost + cpu_operator_cost)
- *                                                          * reltuples
- */
 static double
 estimate_seqscan_cost(BlockNumber relpages, double reltuples)
 {
@@ -430,30 +699,17 @@ estimate_seqscan_cost(BlockNumber relpages, double reltuples)
          + rows  * (cpu_tuple_cost + cpu_operator_cost);
 }
 
-/*
- * Secondary index scan cost (slide A4 with PG units).
- *   - h_i page reads to descend the tree (random pages)
- *   - n_matching * random_page_cost to fetch each heap tuple
- *     (worst case: every match on a different page)
- *   - per-tuple CPU work
- */
 static double
 cost_index_scan(double n_matching, double height)
 {
     double rows = (n_matching < 1.0) ? 1.0 : n_matching;
 
-    return  height * random_page_cost                            /* descent */
-          + rows   * random_page_cost                            /* heap   */
+    return  height * random_page_cost
+          + rows   * random_page_cost
           + rows   * (cpu_index_tuple_cost + cpu_tuple_cost
                       + cpu_operator_cost);
 }
 
-/*
- * Index creation cost.  We use a simple (sort + bulk-load) approximation:
- *   - one sequential scan of the table
- *   - O(N log N) sort step priced via cpu_operator_cost
- *   - one sequential write of the index pages
- */
 static double
 cost_index_creation(BlockNumber relpages)
 {
@@ -463,19 +719,9 @@ cost_index_creation(BlockNumber relpages)
     sort_log = log(pages) / log(2.0);
     if (sort_log < 1.0) sort_log = 1.0;
 
-    return  pages * seq_page_cost           /* read base table */
+    return  pages * seq_page_cost
           + pages * sort_log * cpu_operator_cost
-          + pages * seq_page_cost;          /* write index     */
-}
-
-/*
- * Per-write maintenance cost: one tree descent + one leaf insert.
- *   (h_i + 1) random pages + cpu_index_tuple_cost
- */
-static double
-cost_per_write_maint(double height)
-{
-    return (height + 1.0) * random_page_cost + cpu_index_tuple_cost;
+          + pages * seq_page_cost;
 }
 
 
@@ -485,7 +731,8 @@ cost_per_write_maint(double height)
 
 static RelStat *
 find_or_create_relstat(Oid relid, const char *relname, const char *nspname,
-                       BlockNumber relpages, double reltuples, int avg_width)
+                       BlockNumber relpages, double reltuples,
+                       int avg_width, int row_size)
 {
     AutoIndexSharedState *state = auto_index_state;
     int i;
@@ -498,6 +745,7 @@ find_or_create_relstat(Oid relid, const char *relname, const char *nspname,
             r->cached_relpages   = relpages;
             r->cached_reltuples  = reltuples;
             r->cached_avg_width  = avg_width;
+            r->cached_row_size   = row_size;
             return r;
         }
     }
@@ -513,19 +761,20 @@ find_or_create_relstat(Oid relid, const char *relname, const char *nspname,
         r->cached_relpages    = relpages;
         r->cached_reltuples   = reltuples;
         r->cached_avg_width   = avg_width;
+        r->cached_row_size    = row_size;
         strlcpy(r->relname, relname, NAMEDATALEN);
         strlcpy(r->nspname, nspname, NAMEDATALEN);
 
         elog(LOG, "auto_index: now tracking %s.%s "
-                  "(relpages=%u reltuples=%.0f avg_width=%d)",
-             nspname, relname, relpages, reltuples, avg_width);
+                  "(relpages=%u reltuples=%.0f avg_width=%d row_size=%d)",
+             nspname, relname, relpages, reltuples, avg_width, row_size);
         return r;
     }
 }
 
 static PredicateInfo *
 find_or_create_predicate(RelStat *r, AttrNumber attno, OpStrategy s,
-                         const char *attname)
+                         int attwidth, const char *attname)
 {
     int i;
 
@@ -533,7 +782,10 @@ find_or_create_predicate(RelStat *r, AttrNumber attno, OpStrategy s,
     {
         if (r->predicates[i].attno == attno &&
             r->predicates[i].op_strategy == s)
+        {
+            r->predicates[i].attwidth = attwidth;
             return &r->predicates[i];
+        }
     }
 
     if (r->num_predicates >= MAX_PREDICATES_PER_REL)
@@ -546,6 +798,7 @@ find_or_create_predicate(RelStat *r, AttrNumber attno, OpStrategy s,
         p->op_strategy        = s;
         p->observation_count  = 0;
         p->avg_selectivity    = 0.0;
+        p->attwidth           = attwidth;
         strlcpy(p->attname, attname, NAMEDATALEN);
         return p;
     }
@@ -557,7 +810,6 @@ upsert_scan_shape(RelStat *r, int n,
 {
     int i, j;
 
-    /* search for an existing matching shape (same column set) */
     for (i = 0; i < r->num_shapes; i++)
     {
         ScanShape *s = &r->shapes[i];
@@ -577,7 +829,6 @@ upsert_scan_shape(RelStat *r, int n,
         if (!same)
             continue;
 
-        /* recurrence: bump count, refresh strategies+sels (latest wins) */
         s->observation_count++;
         for (j = 0; j < n; j++)
         {
@@ -610,30 +861,90 @@ upsert_scan_shape(RelStat *r, int n,
 
 
 /* ================================================================
- *  Predicate harvesting from a SeqScan node
- *
- *  We deliberately do all syscache lookups (op classification,
- *  selectivity, attname) BEFORE acquiring the LWLock, so the lock
- *  is only held during the in-memory state mutation + scoring.
+ *  Existing-index enumeration
  * ================================================================ */
 
-/*
- * A predicate found in the qual list, after classification.
- * Used as a small stack-allocated buffer per SeqScan.
- */
+static int
+enumerate_existing_indexes(Relation rel, ExistingIndexInfo *out, int max_out)
+{
+    List       *indexoidlist;
+    ListCell   *lc;
+    int         count = 0;
+
+    indexoidlist = RelationGetIndexList(rel);
+    foreach(lc, indexoidlist)
+    {
+        Oid         indexoid = lfirst_oid(lc);
+        Relation    idxrel;
+        Form_pg_index idx;
+        int         i, n, off;
+
+        if (count >= max_out)
+            break;
+
+        idxrel = try_relation_open(indexoid, AccessShareLock);
+        if (idxrel == NULL)
+            continue;                  /* index dropped concurrently */
+        if (idxrel->rd_rel->relam != BTREE_AM_OID)
+        {
+            relation_close(idxrel, AccessShareLock);
+            continue;
+        }
+
+        idx = idxrel->rd_index;
+        n = idx->indnatts;
+        if (n > MAX_SHAPE_COLS)
+            n = MAX_SHAPE_COLS;
+
+        out[count].num_cols = n;
+        for (i = 0; i < n; i++)
+            out[count].attnos[i] = idx->indkey.values[i];
+
+        off = 0;
+        out[count].key_str[0] = '\0';
+        for (i = 0; i < n; i++)
+        {
+            int w = snprintf(out[count].key_str + off,
+                             MAX_INDEX_KEY_STR - off,
+                             (i == 0) ? "%d" : ",%d",
+                             (int) out[count].attnos[i]);
+            if (w < 0 || off + w >= MAX_INDEX_KEY_STR) break;
+            off += w;
+        }
+
+        count++;
+        relation_close(idxrel, AccessShareLock);
+    }
+    list_free(indexoidlist);
+    return count;
+}
+
+
+/* ================================================================
+ *  Phase 1 - predicate harvesting from a SeqScan
+ * ================================================================ */
+
 typedef struct LocalPred
 {
     AttrNumber  attno;
     OpStrategy  strategy;
-    double      selectivity;
+    double      selectivity;            /* filled in caller-side */
+    int         attwidth;
+
+    /* value/type carried through to the selectivity estimator */
+    bool        has_value;
+    Datum       value;
+    Oid         value_type;
+    Oid         collation;
+
     char        attname[NAMEDATALEN];
 } LocalPred;
 
 #define MAX_LOCAL_PREDS 16
 
 /*
- * Merge two predicates on the same column when one is >=/> and the
- * other is <=/<.  Mutates preds[]/n in place.
+ * If we have predicates ">=/>" and "<=/<" on the same column in the
+ * same scan, fuse them into a single OP_RANGE.
  */
 static void
 collapse_range_pairs(LocalPred *preds, int *n_inout)
@@ -642,20 +953,16 @@ collapse_range_pairs(LocalPred *preds, int *n_inout)
 
     for (i = 0; i < n; i++)
     {
-        bool i_lower = (preds[i].strategy == OP_GT ||
-                        preds[i].strategy == OP_GE);
-        bool i_upper = (preds[i].strategy == OP_LT ||
-                        preds[i].strategy == OP_LE);
+        bool i_lower = (preds[i].strategy == OP_GT || preds[i].strategy == OP_GE);
+        bool i_upper = (preds[i].strategy == OP_LT || preds[i].strategy == OP_LE);
 
         if (!i_lower && !i_upper)
             continue;
 
         for (j = i + 1; j < n; j++)
         {
-            bool j_lower = (preds[j].strategy == OP_GT ||
-                            preds[j].strategy == OP_GE);
-            bool j_upper = (preds[j].strategy == OP_LT ||
-                            preds[j].strategy == OP_LE);
+            bool j_lower = (preds[j].strategy == OP_GT || preds[j].strategy == OP_GE);
+            bool j_upper = (preds[j].strategy == OP_LT || preds[j].strategy == OP_LE);
 
             if (preds[j].attno != preds[i].attno)
                 continue;
@@ -663,9 +970,9 @@ collapse_range_pairs(LocalPred *preds, int *n_inout)
                 continue;
 
             preds[i].strategy    = OP_RANGE;
-            preds[i].selectivity = estimate_ineq_selectivity(OP_RANGE);
+            preds[i].has_value   = false;        /* range -> default sel */
+            preds[i].selectivity = DEFAULT_RANGE_INEQ_SEL;
 
-            /* drop preds[j] by shifting tail down */
             {
                 int k;
                 for (k = j; k < n - 1; k++)
@@ -678,15 +985,10 @@ collapse_range_pairs(LocalPred *preds, int *n_inout)
     *n_inout = n;
 }
 
-/*
- * Sort predicates by attno ascending so {a,b} and {b,a} collapse to
- * the same shape later.
- */
 static void
 sort_preds_by_attno(LocalPred *preds, int n)
 {
     int i, j;
-
     for (i = 1; i < n; i++)
     {
         LocalPred tmp = preds[i];
@@ -701,11 +1003,32 @@ sort_preds_by_attno(LocalPred *preds, int n)
 }
 
 /*
- * Attempt to extract a single (attno, opno) predicate from one node.
- * Returns true and fills *out_attno / *out_opno on success.
+ * Try to interpret one qual node as "this-relation column op literal".
+ *
+ * Output (filled on success):
+ *   *out_attno   - column number on our relation
+ *   *out_opno    - operator OID
+ *   *out_var_left - true iff Var was on the LHS (so the operator's
+ *                  strategy applies as-is; if false, caller should
+ *                  flip_strategy())
+ *   *out_value   - Datum value of the literal (if present)
+ *   *out_value_type - Oid of the literal's type
+ *   *out_collation  - collation OID (from the OpExpr)
+ *   *out_has_value  - true if we extracted a Const value
+ *
+ * Identifying "this relation":
+ *   - If both sides are Vars, we keep the one whose varattno resolves
+ *     to a valid attribute on `relid` via get_attname.  That handles
+ *     join quals where the planner left a Var (rather than a Param)
+ *     for the foreign side.  If both Vars resolve, the LHS is taken
+ *     as ours.
  */
 static bool
-extract_simple_predicate(Node *clause, AttrNumber *out_attno, Oid *out_opno)
+extract_simple_predicate(Node *clause, Oid relid,
+                         AttrNumber *out_attno, Oid *out_opno,
+                         bool *out_var_left,
+                         Datum *out_value, Oid *out_value_type,
+                         Oid *out_collation, bool *out_has_value)
 {
     if (clause == NULL)
         return false;
@@ -714,7 +1037,6 @@ extract_simple_predicate(Node *clause, AttrNumber *out_attno, Oid *out_opno)
     {
         OpExpr *op = (OpExpr *) clause;
         Node   *l, *r;
-        Var    *var = NULL;
 
         if (list_length(op->args) != 2)
             return false;
@@ -722,52 +1044,119 @@ extract_simple_predicate(Node *clause, AttrNumber *out_attno, Oid *out_opno)
         l = (Node *) linitial(op->args);
         r = (Node *) lsecond(op->args);
 
+        /* Var op Const  /  Var op Param */
         if (IsA(l, Var) && (IsA(r, Const) || IsA(r, Param)))
-            var = (Var *) l;
-        else if (IsA(r, Var) && (IsA(l, Const) || IsA(l, Param)))
-            var = (Var *) r;
-        if (var == NULL)
-            return false;
+        {
+            Var *v = (Var *) l;
+            *out_attno     = v->varattno;
+            *out_opno      = op->opno;
+            *out_var_left  = true;
+            *out_collation = op->inputcollid;
+            *out_has_value = false;
+            *out_value     = (Datum) 0;
+            *out_value_type = InvalidOid;
+            if (IsA(r, Const))
+            {
+                Const *c = (Const *) r;
+                if (!c->constisnull)
+                {
+                    *out_value      = c->constvalue;
+                    *out_value_type = c->consttype;
+                    *out_has_value  = true;
+                }
+            }
+            return true;
+        }
+        if (IsA(r, Var) && (IsA(l, Const) || IsA(l, Param)))
+        {
+            Var *v = (Var *) r;
+            *out_attno     = v->varattno;
+            *out_opno      = op->opno;
+            *out_var_left  = false;          /* caller must flip strategy */
+            *out_collation = op->inputcollid;
+            *out_has_value = false;
+            *out_value     = (Datum) 0;
+            *out_value_type = InvalidOid;
+            if (IsA(l, Const))
+            {
+                Const *c = (Const *) l;
+                if (!c->constisnull)
+                {
+                    *out_value      = c->constvalue;
+                    *out_value_type = c->consttype;
+                    *out_has_value  = true;
+                }
+            }
+            return true;
+        }
 
-        *out_attno = var->varattno;
-        *out_opno  = op->opno;
-        return true;
+        /* Var op Var (join case): pick the one that belongs to relid. */
+        if (IsA(l, Var) && IsA(r, Var))
+        {
+            Var *vl = (Var *) l;
+            Var *vr = (Var *) r;
+            char *l_name = (vl->varattno > 0)
+                ? get_attname(relid, vl->varattno, true) : NULL;
+            char *r_name = (vr->varattno > 0)
+                ? get_attname(relid, vr->varattno, true) : NULL;
+
+            if (l_name != NULL)
+            {
+                *out_attno     = vl->varattno;
+                *out_opno      = op->opno;
+                *out_var_left  = true;
+                *out_collation = op->inputcollid;
+                *out_has_value = false;       /* foreign Var -> no value */
+                *out_value     = (Datum) 0;
+                *out_value_type = InvalidOid;
+                return true;
+            }
+            if (r_name != NULL)
+            {
+                *out_attno     = vr->varattno;
+                *out_opno      = op->opno;
+                *out_var_left  = false;
+                *out_collation = op->inputcollid;
+                *out_has_value = false;
+                *out_value     = (Datum) 0;
+                *out_value_type = InvalidOid;
+                return true;
+            }
+            return false;
+        }
+        return false;
     }
 
     if (IsA(clause, ScalarArrayOpExpr))
     {
         ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) clause;
         Node              *l;
-        Var               *var = NULL;
 
-        /*
-         * Treat "col = ANY (array)" as an equality predicate.  We do
-         * not try to multiply selectivity by array length; equality
-         * selectivity already gives the right cost-model order.
-         */
         if (!sa->useOr)
             return false;
         if (list_length(sa->args) < 1)
             return false;
 
         l = (Node *) linitial(sa->args);
-        if (IsA(l, Var))
-            var = (Var *) l;
-        if (var == NULL)
+        if (!IsA(l, Var))
             return false;
 
-        *out_attno = var->varattno;
-        *out_opno  = sa->opno;
+        {
+            Var *v = (Var *) l;
+            *out_attno     = v->varattno;
+            *out_opno      = sa->opno;
+            *out_var_left  = true;
+            *out_collation = sa->inputcollid;
+            *out_has_value = false;        /* array of values: no single value */
+            *out_value     = (Datum) 0;
+            *out_value_type = InvalidOid;
+        }
         return true;
     }
 
     return false;
 }
 
-/*
- * Process one SeqScan node: harvest predicates, classify, estimate,
- * then update shared state under the lock and re-evaluate candidates.
- */
 static void
 process_seqscan_node(SeqScanState *seqstate)
 {
@@ -777,6 +1166,7 @@ process_seqscan_node(SeqScanState *seqstate)
     char        *nspname;
     BlockNumber  relpages;
     double       reltuples;
+    int          row_size;
     int          avg_width;
     SeqScan     *plan;
     List        *quals;
@@ -784,6 +1174,9 @@ process_seqscan_node(SeqScanState *seqstate)
 
     LocalPred    preds[MAX_LOCAL_PREDS];
     int          n_preds = 0;
+
+    ExistingIndexInfo  local_existing[MAX_EXISTING_INDEXES_PER_REL];
+    int                num_existing = 0;
 
     rel = seqstate->ss.ss_currentRelation;
     if (rel == NULL)
@@ -796,7 +1189,11 @@ process_seqscan_node(SeqScanState *seqstate)
     nspname   = get_namespace_name(RelationGetNamespace(rel));
     relpages  = RelationGetNumberOfBlocks(rel);
     reltuples = rel->rd_rel->reltuples;
-    avg_width = (int) rel->rd_rel->relnatts * 8;  /* coarse default */
+    row_size  = compute_relation_row_size(rel);
+    avg_width = (row_size > 27)
+        ? (row_size - 27) / (RelationGetNumberOfAttributes(rel) > 0
+                              ? RelationGetNumberOfAttributes(rel) : 1)
+        : 8;
 
     if (reltuples <= 0) reltuples = (double) relpages * 100.0;
     if (relpages  == 0) relpages  = 1;
@@ -806,28 +1203,38 @@ process_seqscan_node(SeqScanState *seqstate)
     if (quals == NIL)
         return;
 
-    /* ---- Phase 1: classify each operator we recognize ---- */
+    /* enumerate existing indexes BEFORE acquiring our LWLock */
+    num_existing = enumerate_existing_indexes(rel, local_existing,
+                                              MAX_EXISTING_INDEXES_PER_REL);
+
+    /* ---- Classify each operator we can use ---- */
     foreach(lc, quals)
     {
         Node       *clause = (Node *) lfirst(lc);
-        AttrNumber  attno  = InvalidAttrNumber;
-        Oid         opno   = InvalidOid;
+        AttrNumber  attno = InvalidAttrNumber;
+        Oid         opno  = InvalidOid;
+        bool        var_left = true;
+        Datum       value = (Datum) 0;
+        Oid         value_type = InvalidOid;
+        Oid         collation  = InvalidOid;
+        bool        has_value  = false;
         OpStrategy  strat;
         char       *att;
 
         if (n_preds >= MAX_LOCAL_PREDS)
             break;
 
-        if (!extract_simple_predicate(clause, &attno, &opno))
+        if (!extract_simple_predicate(clause, relid,
+                                      &attno, &opno, &var_left,
+                                      &value, &value_type,
+                                      &collation, &has_value))
             continue;
 
         strat = classify_btree_operator(opno);
         if (strat == OP_NONE || strat == OP_NE)
-        {
-            elog(DEBUG1, "auto_index: skipping non-indexable opno=%u "
-                         "on attno=%d", opno, attno);
             continue;
-        }
+        if (!var_left)
+            strat = flip_strategy(strat);    /* "5 < x" -> "x > 5" */
 
         att = get_attname(relid, attno, true);
         if (att == NULL)
@@ -835,31 +1242,37 @@ process_seqscan_node(SeqScanState *seqstate)
 
         preds[n_preds].attno       = attno;
         preds[n_preds].strategy    = strat;
-        preds[n_preds].selectivity = (strat == OP_EQ)
-            ? estimate_eq_selectivity(relid, attno)
-            : estimate_ineq_selectivity(strat);
+        preds[n_preds].has_value   = has_value;
+        preds[n_preds].value       = value;
+        preds[n_preds].value_type  = value_type;
+        preds[n_preds].collation   = collation;
+        preds[n_preds].attwidth    = get_column_avg_width(relid, attno);
         strlcpy(preds[n_preds].attname, att, NAMEDATALEN);
-        n_preds++;
 
-        elog(LOG, "auto_index: predicate on %s.%s.%s op=%s sel=%.4f",
+        preds[n_preds].selectivity = selectivity_from_pg_stats(
+            relid, attno, strat,
+            value, has_value, value_type, collation);
+
+        elog(LOG, "auto_index: predicate on %s.%s.%s op=%s sel=%.5f "
+                  "(value=%s)",
              nspname, relname, att, opstrategy_name(strat),
-             preds[n_preds - 1].selectivity);
+             preds[n_preds].selectivity,
+             has_value ? "literal" : "param/none");
+        n_preds++;
     }
 
     if (n_preds == 0)
         return;
 
-    /* Merge >=/> with <=/< on the same column into a single RANGE. */
     collapse_range_pairs(preds, &n_preds);
-
-    /* Canonicalize: shape is identified by attnos sorted ascending. */
     sort_preds_by_attno(preds, n_preds);
 
-    /* ---- Update shared state under the lock + re-evaluate ---- */
+    /* ---- Update shared state under the lock ---- */
     LWLockAcquire(&auto_index_state->lock.lock, LW_EXCLUSIVE);
     {
         RelStat *r = find_or_create_relstat(relid, relname, nspname,
-                                            relpages, reltuples, avg_width);
+                                            relpages, reltuples,
+                                            avg_width, row_size);
         if (r != NULL)
         {
             int         i;
@@ -868,16 +1281,23 @@ process_seqscan_node(SeqScanState *seqstate)
             double      shape_sels[MAX_SHAPE_COLS];
             int         n_shape = 0;
 
+            /* refresh existing-index list every observation */
+            r->num_existing_indexes = (num_existing > MAX_EXISTING_INDEXES_PER_REL)
+                                    ? MAX_EXISTING_INDEXES_PER_REL
+                                    : num_existing;
+            for (i = 0; i < r->num_existing_indexes; i++)
+                r->existing_indexes[i] = local_existing[i];
+
             for (i = 0; i < n_preds; i++)
             {
                 PredicateInfo *p = find_or_create_predicate(r,
                                         preds[i].attno,
                                         preds[i].strategy,
+                                        preds[i].attwidth,
                                         preds[i].attname);
                 if (p == NULL)
                     continue;
 
-                /* running mean of selectivity */
                 p->avg_selectivity =
                     ((p->avg_selectivity * p->observation_count)
                      + preds[i].selectivity) / (p->observation_count + 1);
@@ -908,12 +1328,105 @@ process_seqscan_node(SeqScanState *seqstate)
  * ================================================================ */
 
 /*
- * Comparison for sort_candidate_columns.
+ * Walk the index columns left-to-right.  For each:
+ *   - if column not in shape:               stop, return prefix length
+ *   - if column in shape with equality:     contribute selectivity, continue
+ *   - if column in shape with non-equality: contribute selectivity, stop
  *
- * B-tree column ordering (matches the pganalyze rule):
- *   1. equality columns first
- *   2. then by selectivity ascending (most-selective first)
+ * Returns the number of leading index columns usable for restriction.
+ * out_eff_sel is the product of those columns' selectivities (1.0 if 0).
  */
+static int
+prefix_length_for_shape(AttrNumber *idx_attnos, int idx_ncols,
+                        ScanShape *s, double *out_eff_sel)
+{
+    double  eff_sel = 1.0;
+    int     prefix_len = 0;
+    int     i, j;
+
+    for (i = 0; i < idx_ncols; i++)
+    {
+        AttrNumber  col   = idx_attnos[i];
+        int         s_idx = -1;
+
+        for (j = 0; j < s->num_cols; j++)
+        {
+            if (s->attnos[j] == col)
+            {
+                s_idx = j;
+                break;
+            }
+        }
+        if (s_idx < 0)
+            break;
+
+        eff_sel *= s->selectivities[s_idx];
+        prefix_len++;
+
+        if (s->strategies[s_idx] != OP_EQ)
+            break;
+    }
+
+    if (eff_sel < 1e-9) eff_sel = 1e-9;
+    if (out_eff_sel) *out_eff_sel = eff_sel;
+    return prefix_len;
+}
+
+/*
+ * Cost of using a given index (described by its column list) to
+ * answer a given scan shape on relation r.  Returns seq-scan cost
+ * if the index can't be used.
+ */
+static double
+cost_for_index_on_shape(AttrNumber *attnos, int ncols, RelStat *r,
+                        ScanShape *s, double height)
+{
+    double  eff_sel;
+    int     prefix_len = prefix_length_for_shape(attnos, ncols, s, &eff_sel);
+    double  n_match;
+
+    if (prefix_len == 0)
+        return estimate_seqscan_cost(r->cached_relpages, r->cached_reltuples);
+
+    n_match = eff_sel * r->cached_reltuples;
+    return cost_index_scan(n_match, height);
+}
+
+/*
+ * Per-DML maintenance cost in PG cost units, applied once per write.
+ *
+ * Reasoning:
+ *   - cpu_index_tuple_cost: traversing/inserting the new index entry.
+ *   - (entry_size / BLCKSZ) × random_page_cost: amortized leaf-page
+ *     touch.  Wider entries fill leaves faster -> more splits -> more
+ *     random I/O per write.
+ *   - Scaled by the pganalyze ratio so wider indexed columns relative
+ *     to the base row cost more (matches the "% extra rows touched"
+ *     intuition).
+ */
+static double
+compute_per_write_cost(IndexCandidate *c, RelStat *r)
+{
+    int     entry_size = 8;       /* btree item header */
+    int     i;
+    int     row_size = r->cached_row_size;
+    double  ratio;
+    double  base_per_write;
+
+    for (i = 0; i < c->num_cols; i++)
+        entry_size += (c->attwidths[i] > 0 ? c->attwidths[i] : 8);
+
+    if (row_size <= 0) row_size = 100;
+    ratio = (double) entry_size / (double) row_size;
+
+    base_per_write =
+          cpu_index_tuple_cost
+        + ((double) entry_size / (double) BLCKSZ) * random_page_cost;
+
+    return ratio * base_per_write;
+}
+
+
 static int
 cmp_for_btree(OpStrategy sa, double sela, OpStrategy sb, double selb)
 {
@@ -937,6 +1450,7 @@ sort_candidate_columns(IndexCandidate *c)
         AttrNumber  ta = c->attnos[i];
         OpStrategy  ts = c->strategies[i];
         double      tx = c->selectivities[i];
+        int         tw = c->attwidths[i];
         char        tn[NAMEDATALEN];
         memcpy(tn, c->attnames[i], NAMEDATALEN);
 
@@ -948,20 +1462,18 @@ sort_candidate_columns(IndexCandidate *c)
             c->attnos[j]        = c->attnos[j-1];
             c->strategies[j]    = c->strategies[j-1];
             c->selectivities[j] = c->selectivities[j-1];
+            c->attwidths[j]     = c->attwidths[j-1];
             memcpy(c->attnames[j], c->attnames[j-1], NAMEDATALEN);
             j--;
         }
         c->attnos[j]        = ta;
         c->strategies[j]    = ts;
         c->selectivities[j] = tx;
+        c->attwidths[j]     = tw;
         memcpy(c->attnames[j], tn, NAMEDATALEN);
     }
 }
 
-/*
- * key_str is built from attnos in their FINAL (sorted-for-btree) order
- * so two candidates with identical column ordering compare equal.
- */
 static void
 serialize_candidate_key(IndexCandidate *c)
 {
@@ -979,65 +1491,31 @@ serialize_candidate_key(IndexCandidate *c)
     }
 }
 
+/*
+ * True if this candidate is a duplicate of an existing real index,
+ * an already-created auto_index index, or already pending creation.
+ */
 static bool
-candidate_already_created(RelStat *r, IndexCandidate *c)
+candidate_already_exists(RelStat *r, IndexCandidate *c)
 {
     int i;
     for (i = 0; i < r->num_created; i++)
-    {
         if (strcmp(r->created_keys[i], c->key_str) == 0)
             return true;
-    }
+    for (i = 0; i < r->num_existing_indexes; i++)
+        if (strcmp(r->existing_indexes[i].key_str, c->key_str) == 0)
+            return true;
+    if (r->has_pending_request &&
+        strcmp(r->pending_key, c->key_str) == 0)
+        return true;
     return false;
 }
 
 /*
- * Can this candidate index serve this scan shape?
- *
- * Rules:
- *   (1) every column referenced by the shape must appear in the
- *       candidate's column set, AND
- *   (2) the candidate's leading column must be one referenced by the
- *       shape (otherwise B-tree can't restrict on the leading col).
- *
- * This is a slight simplification of what the planner actually does
- * but it is correct and conservative for our cost-benefit pass.
- */
-static bool
-candidate_can_serve_shape(IndexCandidate *c, ScanShape *s)
-{
-    int i, j;
-    bool leading_in_shape = false;
-
-    for (i = 0; i < s->num_cols; i++)
-    {
-        bool found = false;
-        for (j = 0; j < c->num_cols; j++)
-        {
-            if (c->attnos[j] == s->attnos[i])
-            {
-                found = true;
-                break;
-            }
-        }
-        if (!found)
-            return false;
-    }
-    for (i = 0; i < s->num_cols; i++)
-    {
-        if (s->attnos[i] == c->attnos[0])
-        {
-            leading_in_shape = true;
-            break;
-        }
-    }
-    return leading_in_shape;
-}
-
-/*
- * Score one candidate against everything we have observed for the
- * relation: cost-improvement summed over all servable shapes, minus
- * maintenance cost for every recorded write, minus one-time creation.
+ * Score a candidate against every recorded shape.  For each shape:
+ *   best_existing_cost = min(seq_cost, min over existing indexes)
+ *   if candidate beats best_existing_cost, accumulate the gain.
+ * Then compute creation surcharge from pganalyze write_overhead.
  */
 static void
 score_candidate(IndexCandidate *c, RelStat *r)
@@ -1055,76 +1533,51 @@ score_candidate(IndexCandidate *c, RelStat *r)
 
     for (i = 0; i < r->num_shapes; i++)
     {
-        ScanShape *s = &r->shapes[i];
-        double     eff_sel;
-        double     n_match;
-        double     idx_cost;
-        double     gain;
+        ScanShape  *s = &r->shapes[i];
+        double      cand_cost;
+        double      best_existing_cost;
+        double      gain;
 
-        if (!candidate_can_serve_shape(c, s))
-            continue;
+        cand_cost = cost_for_index_on_shape(c->attnos, c->num_cols, r, s, height);
+        if (cand_cost >= seq_cost)
+            continue;                  /* candidate doesn't help this shape */
 
-        /*
-         * Effective selectivity = product of selectivities of the
-         * candidate's leading-prefix columns that are actually used
-         * by the shape.  This is the textbook A8 (composite index)
-         * approximation under independence.
-         */
-        eff_sel = 1.0;
-        for (k = 0; k < c->num_cols; k++)
+        /* what does the relation already offer for this shape? */
+        best_existing_cost = seq_cost;
+        for (k = 0; k < r->num_existing_indexes; k++)
         {
-            int q;
-            bool used_by_shape = false;
-            double sel_for_col = 1.0;
-
-            for (q = 0; q < s->num_cols; q++)
-            {
-                if (s->attnos[q] == c->attnos[k])
-                {
-                    used_by_shape = true;
-                    sel_for_col   = s->selectivities[q];
-                    break;
-                }
-            }
-            if (!used_by_shape)
-                break;          /* prefix terminates here */
-            eff_sel *= sel_for_col;
+            ExistingIndexInfo *e = &r->existing_indexes[k];
+            double ec = cost_for_index_on_shape(e->attnos, e->num_cols,
+                                                r, s, height);
+            if (ec < best_existing_cost)
+                best_existing_cost = ec;
         }
-        if (eff_sel < 1e-9) eff_sel = 1e-9;
 
-        n_match  = eff_sel * r->cached_reltuples;
-        idx_cost = cost_index_scan(n_match, height);
+        if (cand_cost >= best_existing_cost)
+            continue;                  /* an existing index already beats us */
 
-        gain = (seq_cost - idx_cost) * (double) s->observation_count;
+        gain  = (best_existing_cost - cand_cost) * (double) s->observation_count;
         if (gain < 0.0) gain = 0.0;
-
         c->total_benefit += gain;
         c->shapes_covered++;
     }
 
-    c->maint_cost    = (double) r->write_count * cost_per_write_maint(height);
-    c->creation_cost = cost_index_creation(r->cached_relpages);
-    c->net_benefit   = c->total_benefit - c->maint_cost - c->creation_cost;
+    c->creation_cost   = cost_index_creation(r->cached_relpages);
+    c->per_write_cost  = compute_per_write_cost(c, r);
+    c->total_cost      = c->creation_cost + c->per_write_cost * (double) r->write_count;
+    c->net_benefit     = c->total_benefit - c->total_cost;
 }
 
-/*
- * Generate candidates for a relation.  For each shape we emit:
- *   (a) one composite candidate using ALL of the shape's columns
- *       (with btree-friendly ordering), and
- *   (b) one singleton per column in the shape.
- *
- * Duplicates (same key_str) are de-duped.
- */
 static int
 build_candidates(RelStat *r, IndexCandidate *out, int max_out)
 {
-    int      i, j, k, count = 0;
+    int     i, j, k, count = 0;
 
     for (i = 0; i < r->num_shapes; i++)
     {
         ScanShape *s = &r->shapes[i];
 
-        /* (a) composite candidate using all columns in the shape */
+        /* (a) one composite using all shape columns */
         if (count < max_out)
         {
             IndexCandidate *c = &out[count];
@@ -1135,76 +1588,77 @@ build_candidates(RelStat *r, IndexCandidate *out, int max_out)
             c->num_cols = eff_cols;
             for (j = 0; j < eff_cols; j++)
             {
-                PredicateInfo *p;
                 c->attnos[j]        = s->attnos[j];
                 c->strategies[j]    = s->strategies[j];
                 c->selectivities[j] = s->selectivities[j];
+                c->attwidths[j]     = 0;        /* fill below */
+                c->attnames[j][0]   = '\0';
 
-                /* attempt to find a name from predicates (best effort) */
-                c->attnames[j][0] = '\0';
                 for (k = 0; k < r->num_predicates; k++)
                 {
-                    p = &r->predicates[k];
+                    PredicateInfo *p = &r->predicates[k];
                     if (p->attno == s->attnos[j])
                     {
                         strlcpy(c->attnames[j], p->attname, NAMEDATALEN);
+                        c->attwidths[j] = p->attwidth;
                         break;
                     }
                 }
+                if (c->attwidths[j] <= 0)
+                    c->attwidths[j] = get_column_avg_width(r->relid,
+                                                           c->attnos[j]);
             }
             sort_candidate_columns(c);
             serialize_candidate_key(c);
 
-            /* dedupe */
             {
                 bool dup = false;
                 int  q;
                 for (q = 0; q < count; q++)
-                {
                     if (strcmp(out[q].key_str, c->key_str) == 0)
                     {
                         dup = true;
                         break;
                     }
-                }
                 if (!dup) count++;
             }
         }
 
-        /* (b) one singleton per column */
+        /* (b) one singleton per column in the shape */
         for (j = 0; j < s->num_cols && count < max_out; j++)
         {
             IndexCandidate *c = &out[count];
-            int             k2;
 
             MemSet(c, 0, sizeof(*c));
             c->num_cols           = 1;
             c->attnos[0]          = s->attnos[j];
             c->strategies[0]      = s->strategies[j];
             c->selectivities[0]   = s->selectivities[j];
+            c->attwidths[0]       = 0;
             c->attnames[0][0]     = '\0';
-            for (k2 = 0; k2 < r->num_predicates; k2++)
+            for (k = 0; k < r->num_predicates; k++)
             {
-                if (r->predicates[k2].attno == s->attnos[j])
+                PredicateInfo *p = &r->predicates[k];
+                if (p->attno == s->attnos[j])
                 {
-                    strlcpy(c->attnames[0],
-                            r->predicates[k2].attname, NAMEDATALEN);
+                    strlcpy(c->attnames[0], p->attname, NAMEDATALEN);
+                    c->attwidths[0] = p->attwidth;
                     break;
                 }
             }
+            if (c->attwidths[0] <= 0)
+                c->attwidths[0] = get_column_avg_width(r->relid, c->attnos[0]);
             serialize_candidate_key(c);
 
             {
                 bool dup = false;
                 int  q;
                 for (q = 0; q < count; q++)
-                {
                     if (strcmp(out[q].key_str, c->key_str) == 0)
                     {
                         dup = true;
                         break;
                     }
-                }
                 if (!dup) count++;
             }
         }
@@ -1213,10 +1667,6 @@ build_candidates(RelStat *r, IndexCandidate *out, int max_out)
     return count;
 }
 
-/*
- * Build candidates, score them all, pick the best uncreated one with
- * positive net benefit, and stage it for the bgworker.
- */
 static void
 evaluate_and_propose(RelStat *r)
 {
@@ -1226,39 +1676,43 @@ evaluate_and_propose(RelStat *r)
     double         best_net = 0.0;
 
     if (r->has_pending_request)
-    {
-        /* don't pile up work for the bgworker */
         return;
-    }
 
     n = build_candidates(r, cands, MAX_LOCAL_CANDIDATES);
     if (n == 0)
         return;
 
     elog(LOG, "auto_index: evaluating %d candidate(s) for %s.%s "
-              "(shapes=%d, writes=%ld, relpages=%u, reltuples=%.0f)",
+              "(shapes=%d existing_idx=%d writes=%ld relpages=%u "
+              "reltuples=%.0f row_size=%d)",
          n, r->nspname, r->relname,
-         r->num_shapes, (long) r->write_count,
-         r->cached_relpages, r->cached_reltuples);
+         r->num_shapes, r->num_existing_indexes,
+         (long) r->write_count,
+         r->cached_relpages, r->cached_reltuples, r->cached_row_size);
+
+    for (i = 0; i < r->num_existing_indexes; i++)
+        elog(LOG, "auto_index:   existing_idx[%s]",
+             r->existing_indexes[i].key_str);
 
     for (i = 0; i < n; i++)
     {
         IndexCandidate *c = &cands[i];
 
-        if (candidate_already_created(r, c))
+        if (candidate_already_exists(r, c))
         {
-            elog(DEBUG1, "auto_index:   cand[%s] already created, skip",
+            elog(LOG, "auto_index:   cand[%s] skipped (already present)",
                  c->key_str);
             continue;
         }
 
         score_candidate(c, r);
 
-        elog(LOG, "auto_index:   cand[%s] cols=%d covers=%d "
-                  "benefit=%.2f maint=%.2f creation=%.2f net=%.2f",
-             c->key_str, c->num_cols, c->shapes_covered,
-             c->total_benefit, c->maint_cost,
-             c->creation_cost, c->net_benefit);
+       elog(LOG, "auto_index:   cand[%s] cols=%d covers=%d benefit=%.2f "
+          "creation=%.2f per_write=%.4f writes=%ld total_cost=%.2f net=%.2f",
+            c->key_str, c->num_cols, c->shapes_covered,
+            c->total_benefit, c->creation_cost,
+            c->per_write_cost, (long) r->write_count,
+            c->total_cost, c->net_benefit);
 
         if (c->net_benefit > best_net)
         {
@@ -1273,39 +1727,35 @@ evaluate_and_propose(RelStat *r)
         return;
     }
 
-    /* stage the chosen candidate for the bgworker */
     {
         IndexCandidate *c = &cands[best_idx];
         char            cols_csv[512];
         int             off = 0;
         int             k;
+        char           *p;
 
         cols_csv[0] = '\0';
         for (k = 0; k < c->num_cols; k++)
         {
-            const char *name = c->attnames[k][0]
-                              ? c->attnames[k] : "?";
-            int          w   = snprintf(cols_csv + off,
-                                        sizeof(cols_csv) - off,
-                                        (k == 0) ? "\"%s\"" : ",\"%s\"",
-                                        name);
+            const char *name = c->attnames[k][0] ? c->attnames[k] : "?";
+            int         w   = snprintf(cols_csv + off,
+                                       sizeof(cols_csv) - off,
+                                       (k == 0) ? "\"%s\"" : ",\"%s\"",
+                                       name);
             if (w < 0 || off + w >= (int) sizeof(cols_csv))
                 break;
             off += w;
         }
 
-        snprintf(r->pending_sql, sizeof(r->pending_sql),
-                 "CREATE INDEX IF NOT EXISTS auto_idx_%u_%s "
-                 "ON %s.%s (%s)",
-                 r->relid, c->key_str,
-                 r->nspname, r->relname, cols_csv);
+        char safe_key[MAX_INDEX_KEY_STR];
+        strlcpy(safe_key, c->key_str, sizeof(safe_key));
+        for (p = safe_key; *p; p++)
+            if (*p == ',') *p = '_';
 
-        /* sanitize key_str for the index name (commas -> underscores) */
-        {
-            char *p;
-            for (p = r->pending_sql; *p; p++)
-                if (*p == ',') *p = '_';
-        }
+        snprintf(r->pending_sql, sizeof(r->pending_sql),
+                "CREATE INDEX IF NOT EXISTS auto_idx_%u_%s "
+                "ON %s.%s (%s)",
+         r->relid, safe_key, r->nspname, r->relname, cols_csv);
 
         strlcpy(r->pending_key, c->key_str, MAX_INDEX_KEY_STR);
         r->has_pending_request = true;
@@ -1347,7 +1797,7 @@ bump_writes_for_modify(QueryDesc *queryDesc)
             {
                 r->write_count++;
                 elog(DEBUG1, "auto_index: write counted for %s.%s "
-                             "(total=%ld)",
+                             "(total=%ld) [logging only]",
                      r->nspname, r->relname, (long) r->write_count);
                 break;
             }
@@ -1391,7 +1841,7 @@ auto_index_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 
 
 /* ================================================================
- *  Background worker - executes pending CREATE INDEX requests
+ *  Background worker
  * ================================================================ */
 
 static void
@@ -1403,10 +1853,6 @@ auto_index_sigterm(SIGNAL_ARGS)
     errno = save_errno;
 }
 
-/*
- * Run the pending CREATE INDEX for one relation.  Called with NO lock
- * held; we re-acquire the lock briefly to swap state in/out.
- */
 static void
 maybe_create_pending_index(RelStat *entry)
 {
@@ -1482,10 +1928,6 @@ auto_index_worker_main(Datum main_arg)
     pqsignal(SIGTERM, auto_index_sigterm);
     BackgroundWorkerUnblockSignals();
 
-    /*
-     * Connect to the "postgres" database as the bootstrap user.
-     * Adjust here if you need a different default DB / role.
-     */
     BackgroundWorkerInitializeConnection("postgres", NULL, 0);
 
     elog(LOG, "auto_index: background worker started");
@@ -1507,7 +1949,6 @@ auto_index_worker_main(Datum main_arg)
         if (auto_index_state == NULL)
             continue;
 
-        /* take a snapshot of which entries have pending work */
         LWLockAcquire(&auto_index_state->lock.lock, LW_SHARED);
         for (i = 0; i < auto_index_state->num_entries; i++)
         {

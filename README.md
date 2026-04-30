@@ -1,166 +1,173 @@
-# auto_index — automatic index recommender / creator
+# auto_index — v3
 
-This is the v2 build with phases 0-4 from the plan:
+A PostgreSQL extension that observes SeqScans, scores candidate
+B-tree indexes against a textbook + pganalyze cost model, and asks a
+background worker to create the winners.
 
-| Phase | What it does |
-|------:|---|
-| **0** | Per-relation tracking with sub-arrays for predicates and scan shapes (replaces the flat per-(relid, attno) array). |
-| **1** | Operator detection via `pg_amop` + B-tree strategy numbers. Handles `=`, `<`, `<=`, `>`, `>=`, `IN (...)`, and synthesizes `RANGE` from `>=`/`<=` pairs on the same column. |
-| **2** | Cost model uses PostgreSQL's planner GUCs (`seq_page_cost`, `random_page_cost`, `cpu_tuple_cost`, `cpu_operator_cost`, `cpu_index_tuple_cost`). Selectivity comes from `pg_statistic.n_distinct` for equality and the planner's defaults for inequalities/ranges. Index height is estimated from `reltuples` and average key width. |
-| **3** | Multi-column candidates with B-tree column ordering (equality columns first, then by selectivity ascending). Singletons and composites are both proposed; the scorer picks the winner. |
-| **4** | Each candidate is scored against every recorded scan shape on the relation, not just the one that triggered it. Indexes already created by `auto_index` are tracked so they're not re-proposed. |
+This is **v3**.  It builds on v2's per-relation tracking, generalized
+operator detection, multi-column candidates, and cross-shape benefit
+accounting.  v3 fixes four specific weaknesses that surfaced during
+review of v2.
 
 ---
-SHOW data_directory;
-## Build & install
 
-The extension must be loaded via `shared_preload_libraries` because it
-registers a background worker.
+## What changed in v3
 
-```bash
-# from inside the source directory:
-make
-sudo make install
+### 1. Write overhead is now the pganalyze ratio
+v2 multiplied a fixed `INDEX_MAINTENANCE_COST` by `write_count` and
+charged that into the candidate's cost.  That conflated "how much
+have we written historically" with "how much extra work will this
+new index cost on every future write".
 
-# tell Postgres to load it on startup
-echo "shared_preload_libraries = 'auto_index'" \
-  | sudo tee -a $(pg_config --sharedir | sed 's|/share|/data|')/postgresql.conf
-# (or edit your postgresql.conf manually)
+v3 uses the pganalyze "Index Write Overhead" formula instead:
 
-# restart Postgres
-sudo systemctl restart postgresql        # or pg_ctl restart
+```
+write_overhead = (8 + Σ avg_width(indexed columns)) / row_size
+row_size       = 23 (tuple header) + 4 (item ptr) + Σ avg_width(all columns)
+total_cost     = creation_cost × (1 + write_overhead)
 ```
 
-Then in any database:
+It is a unitless ratio, applied as a surcharge to the one-time
+creation cost.  `write_count` is still tracked on `RelStat` and
+printed in log lines, but **it does not enter the math**.
 
+Code: `compute_write_overhead()`, `compute_relation_row_size()`.
+
+### 2. Selectivity from real pg_statistic
+v2 used `1 / n_distinct` for equality (good, but with a bug for
+negative `stadistinct`) and a hardcoded `1/3` for inequality.
+
+v3 reads pg_statistic directly:
+
+* **Equality with a Const value**: probes the MCV list
+  (`STATISTIC_KIND_MCV`).  If the value matches an MCV, that
+  bucket's frequency is used.  Otherwise:
+  `(1 − Σ MCV freq) / (n_distinct − n_mcv)`.
+* **Inequality with a Const value**: histogram bucket interpolation
+  (`STATISTIC_KIND_HISTOGRAM`) via binary search using the type's
+  comparison proc from typcache.  Implements the chapter 16.41
+  fraction-of-buckets formula.
+* **Param / foreign Var / no value**: falls back to planner defaults
+  (`DEFAULT_EQ_SEL`, `DEFAULT_INEQ_SEL`, `DEFAULT_RANGE_INEQ_SEL`).
+
+`get_n_distinct()` correctly resolves negative `stadistinct`
+(meaning "fraction of ntuples") into an absolute number — the v2
+bug where this came out negative is fixed.
+
+Each call logs the source it used (`source=MCV-hit`,
+`source=histogram`, `source=1/(nd-mcv)`, `source=1/n_distinct`,
+`source=default`) so the cost-model decisions are auditable.
+
+Code: `selectivity_from_pg_stats()`, `get_n_distinct()`.
+
+### 3. Prefix matching + awareness of existing indexes
+**Prefix matching.** v2's `candidate_can_serve_shape` had a bug: it
+checked the first index column against `c->attnos[0]`, which assumed
+the candidate's column ordering matched the shape's column ordering.
+It also required all shape columns to be in the index.
+
+v3's `prefix_length_for_shape()` walks index columns left-to-right
+and returns the number of leading columns that match the shape with
+**equality**, stopping at the first absent or non-equality column.
+This is the actual B-tree access rule:
+
+* Index `(a, b, c, d)` on shape `{a=, b=, c=}` → prefix=3.
+* Index `(a, b, c)` on shape `{a=, b=}` → prefix=2 (good).
+* Index `(a, b)` on shape `{a=, b=, c=}` → prefix=2, with `c`
+  becoming a residual filter (not a seek key).
+* Index `(a, b, c)` on shape `{a=, b>, c=}` → prefix=2 because the
+  range on `b` truncates the prefix; `c` is a residual.
+
+`cost_for_index_on_shape()` uses prefix length to decide between
+seq-scan cost and index-scan cost.
+
+**Existing-index awareness.** v2 happily proposed indexes that
+duplicated or barely improved on indexes that already existed on the
+relation.  v3 enumerates real indexes from `pg_index` via
+`RelationGetIndexList()`, filters to `BTREE_AM_OID`, and uses
+`try_relation_open()` for safety against concurrent drops.
+
+`score_candidate()` now computes, per shape:
+```
+best_existing_cost = min(seq_cost, min over existing indexes)
+gain               = (best_existing_cost − cand_cost) × observation_count
+```
+Benefit is counted only when the candidate strictly beats what's
+already there.  Duplicates and small improvements score `net=0` and
+are not proposed.
+
+`candidate_already_exists()` blocks proposals that match an existing
+index, an already-created auto_index index, or a pending request.
+
+Code: `prefix_length_for_shape()`, `cost_for_index_on_shape()`,
+`enumerate_existing_indexes()`, `score_candidate()`,
+`candidate_already_exists()`.
+
+### 4. Joins (`Var op Var`)
+v2 only matched `Var op Const` and `Var op Param`.  Join quals like
+`o.customer_id = c.customer_id` produce `Var op Var` after planning
+on whichever side the planner chose to scan.
+
+v3's `extract_simple_predicate()` takes `relid` and handles:
+
+* `Var op Const/Param` (LHS or RHS).  When the Var is on the right
+  (`5 < x`), the operator strategy is run through `flip_strategy()`
+  to recover `x > 5`.
+* `Var op Var`: identifies "ours" via `get_attname(relid, attno, true)`.
+  If exactly one side resolves to a column on `relid`, that's ours
+  and the other side becomes "no value" (selectivity falls back to
+  per-column average / planner defaults).  If both resolve (intra-rel
+  comparison), the LHS is taken.
+
+Code: `extract_simple_predicate()`, `flip_strategy()`.
+
+---
+
+## Build & install
+
+```bash
+cd /path/to/auto_index_v3
+make USE_PGXS=1 PG_CONFIG=$(which pg_config)
+sudo make USE_PGXS=1 PG_CONFIG=$(which pg_config) install
+```
+
+In `postgresql.conf`:
+```
+shared_preload_libraries = 'auto_index'
+```
+
+Restart Postgres, then:
 ```sql
 CREATE EXTENSION auto_index;
 ```
 
-The extension does its work whether or not you run `CREATE EXTENSION` —
-the SQL object is mostly bookkeeping for `pg_extension`. The hooks are
-active as soon as the library is preloaded.
-
-> **Note on the bgworker connection.** It connects to a database called
-> `postgres`. If that doesn't exist on your cluster, edit
-> `auto_index_worker_main` (search for `BackgroundWorkerInitializeConnection`)
-> and change the database name before building.
+The bgworker connects to database `postgres` by default (see
+`BackgroundWorkerInitializeConnection` near the bottom of
+auto_index.c).  Edit if your cluster uses a different db.
 
 ---
 
-## How to verify it's working
+## Testing
 
-### 1. Tail the postmaster log
-Find your log file:
+`test_workload.sql` exercises all four fixes:
 
-```bash
-psql -At -c "SELECT current_setting('log_directory'), current_setting('log_filename');"
-# typical: /var/log/postgresql/postgresql-16-main.log
-sudo tail -F /var/log/postgresql/postgresql-16-main.log | grep auto_index
-```
+| Section | Exercises | What to look for in the log |
+|---|---|---|
+| 1 | MCV-based equality selectivity | `source=MCV-hit`, sels for `'COMPLETED'` (~0.80) vs `'FAILED'` (~0.05) |
+| 2 | Histogram-based range selectivity | `source=histogram`, sel for `amount > 800` ≈ 0.20, NOT 0.33 |
+| 3 | Multi-column composite, B-tree column ordering | Composite candidate puts higher-cardinality column first |
+| 4 | EQ + RANGE composite, prefix truncation | Range column placed last; prefix walk stops at it |
+| 5 | Bgworker creates the winners | `auto_idx_*` rows in `pg_indexes` |
+| 6 | Existing-index dedup | "skipped (already present)" or "no candidate with positive net benefit" after manually creating `manual_idx_orders_created_at` |
+| 7 | `(a,b)` covers shape `{a,b,c}` via prefix | Composite candidate scores positive `covers` on the 3-col shape |
+| 8 | `Var op Var` join smoke test | No crash; predicate logged with `value=param/none` if foreign-Var case is hit |
+| 9 | Final state + EXPLAIN | Planner uses the auto-created indexes |
 
-### 2. Run the test workload
+Run:
 ```bash
 psql -d postgres -f test_workload.sql
+tail -F /var/log/postgresql/postgresql-*.log | grep auto_index
 ```
-
-### 3. What you should see in the log
-
-Right at server start:
-
-```
-auto_index: shared state initialized (MAX_TRACKED_ENTRIES=128, ...)
-auto_index: extension loaded
-auto_index: background worker started
-```
-
-When the first query in section **1** runs:
-
-```
-auto_index: predicate on public.orders.status op=EQ sel=0.0500
-auto_index: now tracking public.orders (relpages=637 reltuples=100000 avg_width=40)
-auto_index:   new shape on public.orders with 1 column(s)
-auto_index: evaluating 1 candidate(s) for public.orders (shapes=1, writes=0, ...)
-auto_index:   cand[7] cols=1 covers=1 benefit=Y maint=0.00 creation=Z net=...
-```
-
-After enough repetitions of the same shape, when the net benefit goes
-positive:
-
-```
-auto_index: PROPOSING CREATE INDEX IF NOT EXISTS auto_idx_<oid>_7 ON public.orders ("status")
-```
-
-A few seconds later (the bgworker polls every 5s):
-
-```
-auto_index: bgworker executing: CREATE INDEX IF NOT EXISTS auto_idx_<oid>_7 ON public.orders ("status")
-auto_index: bgworker created index (key=7)
-```
-
-For the **multi-column** workload (section 4) you should see lines like:
-
-```
-auto_index: predicate on public.orders.status op=EQ sel=0.0500
-auto_index: predicate on public.orders.customer_id op=EQ sel=0.0010
-auto_index:   new shape on public.orders with 2 column(s)
-auto_index: evaluating 3 candidate(s) for public.orders ...
-auto_index:   cand[2_3] cols=2 covers=1 benefit=... net=...      <-- composite (customer_id, status)
-auto_index:   cand[3]   cols=1 covers=2 benefit=... net=...      <-- singleton on status
-auto_index:   cand[2]   cols=1 covers=1 benefit=... net=...      <-- singleton on customer_id
-auto_index: PROPOSING CREATE INDEX IF NOT EXISTS auto_idx_<oid>_2_3 ON public.orders ("customer_id","status")
-```
-
-Note that `cand[3]` (singleton on `status`) shows `covers=2` because it
-also serves the section-1 shape — that's Phase 4's cross-shape benefit
-accounting in action.
-
-For the **range** workload (section 2), look for the collapse:
-
-```
-auto_index: predicate on public.orders.amount op=GE sel=0.3333
-auto_index: predicate on public.orders.amount op=LE sel=0.3333
-auto_index:   new shape on public.orders with 1 column(s)         <-- collapsed to RANGE
-```
-
-For the **write-heavy** part (section 9), the `maint=` number in the
-`cand[...]` LOG line should be much larger than it was earlier in the
-session — that's the per-write maintenance cost (Phase 2) being
-multiplied by `write_count` (Phase 0).
-
-### 4. Verify the indexes exist
-The test script ends with:
-
-```sql
-SELECT indexname, indexdef FROM pg_indexes
- WHERE tablename = 'orders' AND indexname LIKE 'auto_idx%';
-```
-
-You should see one row per auto-created index, with names like
-`auto_idx_16384_7` (single column) and `auto_idx_16384_2_7` (multi-column).
-
-### 5. Confirm the planner uses them
-The script also runs `EXPLAIN` after the indexes exist; you should see
-`Index Scan` / `Bitmap Index Scan` instead of `Seq Scan`.
-
----
-
-## Troubleshooting
-
-* **No `auto_index:` lines at all in the log** — the library isn't
-  preloaded. Check `SHOW shared_preload_libraries;`.
-* **"auto_index must be loaded via shared_preload_libraries"** on
-  start — same root cause; check `postgresql.conf`.
-* **Bgworker can't connect** — change the database name in
-  `BackgroundWorkerInitializeConnection`.
-* **Net benefit never goes positive** — the table is too small relative
-  to `seq_page_cost`. Either bump the row count in the test workload or
-  run the same query more times. The `cand[...]` LOG line shows you
-  exactly what numbers are being compared.
-* **Lots of `predicate on ...` lines for queries that already use an
-  existing index** — shouldn't happen, since we only walk `SeqScanState`
-  nodes. If it does, double-check that PostgreSQL is actually choosing
-  a seq scan via `EXPLAIN`.
 
 ---
 
@@ -168,9 +175,28 @@ The script also runs `EXPLAIN` after the indexes exist; you should see
 
 | File | Purpose |
 |---|---|
-| `auto_index.c` | The whole implementation, organized into the phase sections noted at the top of the file. |
-| `auto_index.h` | Public-ish data structures held in shared memory. |
-| `auto_index.control` | PGXS extension metadata. |
-| `auto_index--1.0.sql` | Empty SQL upgrade file (PGXS requires one). |
-| `Makefile` | Standard PGXS Makefile. |
-| `test_workload.sql` | End-to-end driver that exercises every phase. |
+| `auto_index.c`         | All logic. ~1950 lines. |
+| `auto_index.h`         | Shared structs (`RelStat`, `PredicateInfo`, `ScanShape`, `ExistingIndexInfo`). |
+| `auto_index.control`   | Extension control file. |
+| `auto_index--1.0.sql`  | Empty extension SQL (no user-facing functions yet). |
+| `Makefile`             | Standard PGXS Makefile. |
+| `test_workload.sql`    | The workload above. |
+
+---
+
+## Logging
+
+Every meaningful decision is on `LOG` and prefixed `auto_index:`.
+Fine-grained traces (per-predicate selectivity sources, per-write
+counters) are on `DEBUG1` — set `log_min_messages = debug1` to see
+them.
+
+Useful greps:
+
+```bash
+grep "auto_index: predicate"     # one line per qual
+grep "auto_index:   cand\["      # one line per scored candidate
+grep "auto_index: PROPOSING"     # winners
+grep "auto_index: bgworker"      # what the bgworker did
+grep "source="                   # which stat source drove a sel
+```
