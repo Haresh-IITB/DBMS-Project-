@@ -1,45 +1,6 @@
-/* ================================================================
- * auto_index.c - v3
- *
- * Automatic index creation extension for PostgreSQL.
- *
- * Sections / phases:
- *
- *   Phase 0  Per-relation tracking (predicates, shapes, existing
- *            indexes, created indexes)
- *   Phase 1  Generalized operator detection (=, <, <=, >, >=, IN,
- *            range pairs) via pg_amop.  Var-on-right correctly
- *            flips the strategy.  Var op Var accepted when one
- *            Var is on the scan's relation (join case).
- *   Phase 2  Selectivity from pg_statistic histograms / MCV / min-
- *            max (chapter 16.39 / 16.41).  Cost model uses the
- *            planner GUCs (seq_page_cost / random_page_cost / ...).
- *   Phase 3  Multi-column candidates with B-tree column ordering.
- *            Candidate-vs-shape match uses prefix-length, not full
- *            shape inclusion -- so an index on (a,b) correctly
- *            serves a shape {a, b, c} (with c becoming a residual
- *            filter) and is correctly truncated by a non-equality
- *            predicate on a leading column.
- *   Phase 4  Cross-shape benefit accounting.  Each candidate is
- *            scored against every recorded shape on the relation
- *            AND against every existing real index on the relation
- *            (read from pg_index): benefit is counted only when
- *            the candidate beats the best existing option.  Write
- *            cost uses the pganalyze "Index Write Overhead" ratio
- *            applied as a surcharge to one-time creation cost.
- *
- * Logging:
- *   - elog(LOG, ...) for every meaningful decision.  Lines start
- *     with "auto_index:" so they are easy to grep for.
- *   - elog(DEBUG1, ...) for fine-grained tracing.
- * ================================================================ */
-
 #include "postgres.h"
-
 #include <math.h>
-
 #include "auto_index.h"
-
 #include "access/attnum.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
@@ -78,9 +39,7 @@
 PG_MODULE_MAGIC;
 
 
-/* ================================================================
- *  Globals & forward declarations
- * ================================================================ */
+// Globals, forward declarations
 
 AutoIndexSharedState *auto_index_state = NULL;
 
@@ -118,7 +77,7 @@ static double selectivity_from_pg_stats(Oid relid, AttrNumber attno,
 
 /* cost */
 static double estimate_index_height(double reltuples, int avg_width);
-static double estimate_seqscan_cost(BlockNumber relpages, double reltuples);
+static double estimate_cost_seqscan(BlockNumber relpages, double reltuples);
 static double cost_index_scan(double n_matching, double height);
 static double cost_index_creation(BlockNumber relpages);
 
@@ -158,8 +117,8 @@ typedef struct IndexCandidate
 
     double      total_benefit;
     double      creation_cost;
-    double      per_write_cost;        /* was write_overhead   */
-    double      total_cost;            /* creation + per_write × write_count */
+    double      per_write_cost;               /* PG cost units, per DML  */
+    double      total_cost;                   /* creation + per_write*N  */
     double      net_benefit;
     int         shapes_covered;
 } IndexCandidate;
@@ -190,9 +149,7 @@ static void   auto_index_sigterm(SIGNAL_ARGS);
 static void   maybe_create_pending_index(RelStat *entry);
 
 
-/* ================================================================
- *  Shared-memory plumbing
- * ================================================================ */
+// Shared memory management
 
 static Size
 auto_index_shmem_size(void)
@@ -246,11 +203,8 @@ auto_index_shmem_startup_hook(void)
     auto_index_shmem_startup();
 }
 
-
-/* ================================================================
- *  Extension init / fini
- * ================================================================ */
-
+// Initialation, final exit code : 
+// The first entry point of the code 
 void
 _PG_init(void)
 {
@@ -262,19 +216,19 @@ _PG_init(void)
                         "shared_preload_libraries")));
 
     prev_shmem_request_hook = shmem_request_hook;
-    shmem_request_hook      = auto_index_shmem_request_hook;
+    shmem_request_hook      = auto_index_shmem_request_hook; // speciefies the size of shem require and locks requried 
 
     prev_shmem_startup_hook = shmem_startup_hook;
-    shmem_startup_hook      = auto_index_shmem_startup_hook;
+    shmem_startup_hook      = auto_index_shmem_startup_hook; // allocates shared meoery 
 
     prev_ExecutorRun = ExecutorRun_hook;
-    ExecutorRun_hook = auto_index_ExecutorRun;
+    ExecutorRun_hook = auto_index_ExecutorRun; // Hook to track the queries and their predicates, runs before every query 
 
     MemSet(&worker, 0, sizeof(worker));
     worker.bgw_flags        = BGWORKER_SHMEM_ACCESS |
-                              BGWORKER_BACKEND_DATABASE_CONNECTION;
+                              BGWORKER_BACKEND_DATABASE_CONNECTION; // So it an create the index 
     worker.bgw_start_time   = BgWorkerStart_RecoveryFinished;
-    worker.bgw_restart_time = 5;
+    worker.bgw_restart_time = 5; // After how much time it restarts 
     snprintf(worker.bgw_name,         BGW_MAXLEN, "auto_index worker");
     snprintf(worker.bgw_library_name, BGW_MAXLEN, "auto_index");
     snprintf(worker.bgw_function_name,BGW_MAXLEN, "auto_index_worker_main");
@@ -289,13 +243,11 @@ _PG_init(void)
 void
 _PG_fini(void)
 {
-    ExecutorRun_hook = prev_ExecutorRun;
+    ExecutorRun_hook = prev_ExecutorRun; // When you work finish, you should go the the next function 
 }
 
 
-/* ================================================================
- *  Phase 1 - operator classification
- * ================================================================ */
+// Classify the operator (step 1 )
 
 static OpStrategy
 classify_btree_operator(Oid opno)
@@ -376,14 +328,7 @@ opstrategy_name(OpStrategy s)
 }
 
 
-/* ================================================================
- *  Phase 2 - selectivity & column-width helpers
- * ================================================================ */
-
-/*
- * Average byte width for one column.  Falls back to typlen for fixed
- * types or 16 for variable-length when no pg_statistic row exists yet.
- */
+// Step 2 : selectivity estimation from pg_statistic
 static int
 get_column_avg_width(Oid relid, AttrNumber attno)
 {
@@ -690,7 +635,7 @@ estimate_index_height(double reltuples, int avg_width)
 }
 
 static double
-estimate_seqscan_cost(BlockNumber relpages, double reltuples)
+estimate_cost_seqscan(BlockNumber relpages, double reltuples)
 {
     double pages = (relpages > 0) ? (double) relpages : 1.0;
     double rows  = (reltuples > 0) ? reltuples         : 1.0;
@@ -1323,19 +1268,7 @@ process_seqscan_node(SeqScanState *seqstate)
 }
 
 
-/* ================================================================
- *  Phase 3 + 4 - candidate generation, scoring, selection
- * ================================================================ */
 
-/*
- * Walk the index columns left-to-right.  For each:
- *   - if column not in shape:               stop, return prefix length
- *   - if column in shape with equality:     contribute selectivity, continue
- *   - if column in shape with non-equality: contribute selectivity, stop
- *
- * Returns the number of leading index columns usable for restriction.
- * out_eff_sel is the product of those columns' selectivities (1.0 if 0).
- */
 static int
 prefix_length_for_shape(AttrNumber *idx_attnos, int idx_ncols,
                         ScanShape *s, double *out_eff_sel)
@@ -1386,46 +1319,41 @@ cost_for_index_on_shape(AttrNumber *attnos, int ncols, RelStat *r,
     double  n_match;
 
     if (prefix_len == 0)
-        return estimate_seqscan_cost(r->cached_relpages, r->cached_reltuples);
+        return estimate_cost_seqscan(r->cached_relpages, r->cached_reltuples);
 
     n_match = eff_sel * r->cached_reltuples;
     return cost_index_scan(n_match, height);
 }
 
 /*
- * Per-DML maintenance cost in PG cost units, applied once per write.
+ * Per-DML maintenance cost in PG cost units, applied once per row written.
  *
- * Reasoning:
- *   - cpu_index_tuple_cost: traversing/inserting the new index entry.
- *   - (entry_size / BLCKSZ) × random_page_cost: amortized leaf-page
- *     touch.  Wider entries fill leaves faster -> more splits -> more
- *     random I/O per write.
- *   - Scaled by the pganalyze ratio so wider indexed columns relative
- *     to the base row cost more (matches the "% extra rows touched"
- *     intuition).
+ *   per_write = cpu_index_tuple_cost
+ *             + (entry_size / BLCKSZ) * random_page_cost
+ *
+ * cpu_index_tuple_cost covers the per-entry CPU work, and the second
+ * term amortizes the leaf-page write across one btree entry of this
+ * width.  Wider entries fill leaves faster -> proportionally more
+ * random I/O per write.
+ *
+ * total_cost = creation_cost + per_write_cost * write_count
+ * gives a single quantity in PG cost units that scales with the
+ * actual write workload.
  */
 static double
 compute_per_write_cost(IndexCandidate *c, RelStat *r)
 {
     int     entry_size = 8;       /* btree item header */
     int     i;
-    int     row_size = r->cached_row_size;
-    double  ratio;
-    double  base_per_write;
+
+    (void) r;
 
     for (i = 0; i < c->num_cols; i++)
         entry_size += (c->attwidths[i] > 0 ? c->attwidths[i] : 8);
 
-    if (row_size <= 0) row_size = 100;
-    ratio = (double) entry_size / (double) row_size;
-
-    base_per_write =
-          cpu_index_tuple_cost
-        + ((double) entry_size / (double) BLCKSZ) * random_page_cost;
-
-    return ratio * base_per_write;
+    return cpu_index_tuple_cost
+         + ((double) entry_size / (double) BLCKSZ) * random_page_cost;
 }
-
 
 static int
 cmp_for_btree(OpStrategy sa, double sela, OpStrategy sb, double selb)
@@ -1515,7 +1443,8 @@ candidate_already_exists(RelStat *r, IndexCandidate *c)
  * Score a candidate against every recorded shape.  For each shape:
  *   best_existing_cost = min(seq_cost, min over existing indexes)
  *   if candidate beats best_existing_cost, accumulate the gain.
- * Then compute creation surcharge from pganalyze write_overhead.
+ * Then total_cost = creation_cost + per_write_cost * write_count
+ * (additive: write workload directly penalises wider/more indexes).
  */
 static void
 score_candidate(IndexCandidate *c, RelStat *r)
@@ -1526,7 +1455,7 @@ score_candidate(IndexCandidate *c, RelStat *r)
 
     height   = estimate_index_height(r->cached_reltuples,
                                      r->cached_avg_width);
-    seq_cost = estimate_seqscan_cost(r->cached_relpages, r->cached_reltuples);
+    seq_cost = estimate_cost_seqscan(r->cached_relpages, r->cached_reltuples);
 
     c->total_benefit  = 0.0;
     c->shapes_covered = 0;
@@ -1564,7 +1493,8 @@ score_candidate(IndexCandidate *c, RelStat *r)
 
     c->creation_cost   = cost_index_creation(r->cached_relpages);
     c->per_write_cost  = compute_per_write_cost(c, r);
-    c->total_cost      = c->creation_cost + c->per_write_cost * (double) r->write_count;
+    c->total_cost      = c->creation_cost
+                       + c->per_write_cost * (double) r->write_count;
     c->net_benefit     = c->total_benefit - c->total_cost;
 }
 
@@ -1674,9 +1604,7 @@ evaluate_and_propose(RelStat *r)
     int            n, i;
     int            best_idx = -1;
     double         best_net = 0.0;
-
-    if (r->has_pending_request)
-        return;
+    bool           can_propose = !r->has_pending_request;
 
     n = build_candidates(r, cands, MAX_LOCAL_CANDIDATES);
     if (n == 0)
@@ -1684,11 +1612,12 @@ evaluate_and_propose(RelStat *r)
 
     elog(LOG, "auto_index: evaluating %d candidate(s) for %s.%s "
               "(shapes=%d existing_idx=%d writes=%ld relpages=%u "
-              "reltuples=%.0f row_size=%d)",
+              "reltuples=%.0f row_size=%d) propose=%s",
          n, r->nspname, r->relname,
          r->num_shapes, r->num_existing_indexes,
          (long) r->write_count,
-         r->cached_relpages, r->cached_reltuples, r->cached_row_size);
+         r->cached_relpages, r->cached_reltuples, r->cached_row_size,
+         can_propose ? "yes" : "blocked-by-pending");
 
     for (i = 0; i < r->num_existing_indexes; i++)
         elog(LOG, "auto_index:   existing_idx[%s]",
@@ -1707,12 +1636,12 @@ evaluate_and_propose(RelStat *r)
 
         score_candidate(c, r);
 
-       elog(LOG, "auto_index:   cand[%s] cols=%d covers=%d benefit=%.2f "
-          "creation=%.2f per_write=%.4f writes=%ld total_cost=%.2f net=%.2f",
-            c->key_str, c->num_cols, c->shapes_covered,
-            c->total_benefit, c->creation_cost,
-            c->per_write_cost, (long) r->write_count,
-            c->total_cost, c->net_benefit);
+        elog(LOG, "auto_index:   cand[%s] cols=%d covers=%d benefit=%.2f "
+                  "creation=%.2f per_write=%.5f writes=%ld total_cost=%.2f net=%.2f",
+             c->key_str, c->num_cols, c->shapes_covered,
+             c->total_benefit, c->creation_cost,
+             c->per_write_cost, (long) r->write_count,
+             c->total_cost, c->net_benefit);
 
         if (c->net_benefit > best_net)
         {
@@ -1727,9 +1656,18 @@ evaluate_and_propose(RelStat *r)
         return;
     }
 
+    if (!can_propose)
+    {
+        elog(LOG, "auto_index:   would propose cand[%s] (net=%.2f) "
+                  "but a request is already pending",
+             cands[best_idx].key_str, best_net);
+        return;
+    }
+
     {
         IndexCandidate *c = &cands[best_idx];
         char            cols_csv[512];
+        char            safe_key[MAX_INDEX_KEY_STR];
         int             off = 0;
         int             k;
         char           *p;
@@ -1747,15 +1685,17 @@ evaluate_and_propose(RelStat *r)
             off += w;
         }
 
-        char safe_key[MAX_INDEX_KEY_STR];
+        /* sanitize key_str into a separate buffer FIRST, so the comma
+         * replacement below cannot corrupt the column list inside (...). */
         strlcpy(safe_key, c->key_str, sizeof(safe_key));
         for (p = safe_key; *p; p++)
             if (*p == ',') *p = '_';
 
         snprintf(r->pending_sql, sizeof(r->pending_sql),
-                "CREATE INDEX IF NOT EXISTS auto_idx_%u_%s "
-                "ON %s.%s (%s)",
-         r->relid, safe_key, r->nspname, r->relname, cols_csv);
+                 "CREATE INDEX IF NOT EXISTS auto_idx_%u_%s "
+                 "ON %s.%s (%s)",
+                 r->relid, safe_key,
+                 r->nspname, r->relname, cols_csv);
 
         strlcpy(r->pending_key, c->key_str, MAX_INDEX_KEY_STR);
         r->has_pending_request = true;
@@ -1769,39 +1709,61 @@ evaluate_and_propose(RelStat *r)
 /* ================================================================
  *  Executor hook
  * ================================================================ */
-
 static void
 bump_writes_for_modify(QueryDesc *queryDesc)
 {
     PlanState *ps = queryDesc->planstate;
+    uint64     processed;
 
     if (ps == NULL || !IsA(ps, ModifyTableState))
+        return;
+
+    /* Get the actual number of rows inserted/updated/deleted */
+    processed = queryDesc->estate->es_processed;
+    if (processed == 0)
         return;
 
     {
         ModifyTableState *mts = (ModifyTableState *) ps;
         ResultRelInfo    *rri = mts->resultRelInfo;
+        Relation          rel;
         Oid               relid;
         int               i;
+        RelStat          *r = NULL;
 
         if (rri == NULL || rri->ri_RelationDesc == NULL)
             return;
 
-        relid = RelationGetRelid(rri->ri_RelationDesc);
+        rel = rri->ri_RelationDesc;
+        if (RelationGetNamespace(rel) == PG_CATALOG_NAMESPACE)
+            return;
+
+        relid = RelationGetRelid(rel);
 
         LWLockAcquire(&auto_index_state->lock.lock, LW_EXCLUSIVE);
+        
+        /* 
+         * THE FIX: Only search for the relation. Do NOT create it.
+         * If it isn't tracked yet, it means we haven't seen a SELECT,
+         * so this is likely an initial bulk load. We ignore it.
+         */
         for (i = 0; i < auto_index_state->num_entries; i++)
         {
-            RelStat *r = &auto_index_state->entries[i];
-            if (r->relid == relid)
+            if (auto_index_state->entries[i].relid == relid)
             {
-                r->write_count++;
-                elog(DEBUG1, "auto_index: write counted for %s.%s "
-                             "(total=%ld) [logging only]",
-                     r->nspname, r->relname, (long) r->write_count);
+                r = &auto_index_state->entries[i];
                 break;
             }
         }
+
+        /* If the table was previously registered by a SELECT, count the writes */
+        if (r != NULL)
+        {
+            r->write_count += processed;
+            elog(DEBUG1, "auto_index: write counted for %s.%s (total=%ld)",
+                 r->nspname, r->relname, (long) r->write_count);
+        }
+        
         LWLockRelease(&auto_index_state->lock.lock);
     }
 }
@@ -1823,6 +1785,13 @@ static void
 auto_index_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
                        uint64 count)
 {
+    /* 1. Run the actual executor first so rows get processed */
+    if (prev_ExecutorRun)
+        prev_ExecutorRun(queryDesc, direction, count);
+    else
+        standard_ExecutorRun(queryDesc, direction, count);
+
+    /* 2. NOW intercept the writes, because es_processed is populated */
     if (queryDesc->operation == CMD_INSERT ||
         queryDesc->operation == CMD_UPDATE ||
         queryDesc->operation == CMD_DELETE)
@@ -1830,15 +1799,10 @@ auto_index_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
         bump_writes_for_modify(queryDesc);
     }
 
-    if (prev_ExecutorRun)
-        prev_ExecutorRun(queryDesc, direction, count);
-    else
-        standard_ExecutorRun(queryDesc, direction, count);
-
+    /* 3. Walk the plan tree for read predicates */
     if (queryDesc->planstate != NULL)
         walk_plan_tree(queryDesc->planstate);
 }
-
 
 /* ================================================================
  *  Background worker
