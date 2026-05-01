@@ -45,7 +45,7 @@ ANALYZE t1_singleton;
 
 \echo '====[ Repeated EQ access: customer_id = ? ]===='
 
-SELECT count(*) FROM t1_singleton WHERE customer_id = 42;
+SELECT count(*) FROM t1_singleton WHERE customer_id >= 42;
 SELECT count(*) FROM t1_singleton WHERE customer_id = 99;
 SELECT count(*) FROM t1_singleton WHERE customer_id = 7;
 SELECT count(*) FROM t1_singleton WHERE customer_id = 333;

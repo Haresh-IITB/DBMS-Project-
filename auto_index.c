@@ -39,6 +39,17 @@
 PG_MODULE_MAGIC;
 
 
+
+// The start function : _PG_init -> with hooks 
+// auto_index_ExecutorRun : Decides what to do with the query , whether it's a read or write 
+// based on this goes to the walk_plan_tree or bump_writes_for_modify
+// process_seqscan_node -> extract_simple_predicate, parses the query : -> classify_btree_operator , collapse range operators 
+// get's the selectivity_from_pg_stats, estimate the score 
+// decide whether to make the index or not 
+// it decided write to shared buffer 
+// auto_index_worker_main (Creates the index in background)
+
+
 // Globals, forward declarations
 
 AutoIndexSharedState *auto_index_state = NULL;
@@ -398,12 +409,7 @@ compute_relation_row_size(Relation rel)
     return total;
 }
 
-/*
- * Resolve pg_statistic.stadistinct to an absolute distinct-count.
- *      > 0 : absolute
- *      < 0 : fraction of ntuples (so n_distinct = -stadistinct * ntuples)
- *      = 0 : unknown -> caller must fall back
- */
+
 static double
 get_n_distinct(Form_pg_statistic stats, double ntuples)
 {
@@ -459,7 +465,7 @@ selectivity_from_pg_stats(Oid relid, AttrNumber attno, OpStrategy s,
     stp = SearchSysCache3(STATRELATTINH,
                           ObjectIdGetDatum(relid),
                           Int16GetDatum(attno),
-                          BoolGetDatum(false));
+                          BoolGetDatum(false)); // If the relation is already analyzed retireve the staticits 
     if (!HeapTupleIsValid(stp))
     {
         elog(DEBUG1, "auto_index: no pg_statistic row for relid=%u attno=%d "
@@ -469,15 +475,13 @@ selectivity_from_pg_stats(Oid relid, AttrNumber attno, OpStrategy s,
     }
     stats = (Form_pg_statistic) GETSTRUCT(stp);
 
-    /* fetch ntuples too -- needed for n_distinct conversion */
+    /* fetch ntuples too -- needed for n_distinct conversion */ // The number of rows in the table, used to compute the distinct values
+    HeapTuple ctp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+    if (HeapTupleIsValid(ctp))
     {
-        HeapTuple ctp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-        if (HeapTupleIsValid(ctp))
-        {
-            Form_pg_class cf = (Form_pg_class) GETSTRUCT(ctp);
-            ntuples = cf->reltuples;
-            ReleaseSysCache(ctp);
-        }
+        Form_pg_class cf = (Form_pg_class) GETSTRUCT(ctp);
+        ntuples = cf->reltuples;
+        ReleaseSysCache(ctp);
     }
 
     /* ---- Equality with value: try MCV ---- */
@@ -485,6 +489,7 @@ selectivity_from_pg_stats(Oid relid, AttrNumber attno, OpStrategy s,
     {
         AttStatsSlot mcv;
 
+        // Check the MCV list for an exact match.  If found, use the corresponding frequency as selectivity.
         if (get_attstatsslot(&mcv, stp,
                              STATISTIC_KIND_MCV, InvalidOid,
                              ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
@@ -515,7 +520,7 @@ selectivity_from_pg_stats(Oid relid, AttrNumber attno, OpStrategy s,
     /* ---- Equality fallback: (1-sumMCV) / (nd - nMCV) ---- */
     if (s == OP_EQ && sel < 0.0)
     {
-        double  nd = get_n_distinct(stats, ntuples);
+        double  nd = get_n_distinct(stats, ntuples); // 
         double  sum_mcv = 0.0;
         int     n_mcv   = 0;
         AttStatsSlot mcv;
@@ -545,7 +550,7 @@ selectivity_from_pg_stats(Oid relid, AttrNumber attno, OpStrategy s,
         && has_value && OidIsValid(value_type) && sel < 0.0)
     {
         AttStatsSlot hist;
-
+        
         if (get_attstatsslot(&hist, stp,
                              STATISTIC_KIND_HISTOGRAM, InvalidOid,
                              ATTSTATSSLOT_VALUES))
@@ -575,7 +580,7 @@ selectivity_from_pg_stats(Oid relid, AttrNumber attno, OpStrategy s,
                     cmp = DatumGetInt32(
                         FunctionCall2Coll(&tce->cmp_proc_finfo, collation,
                                           hist.values[low], value));
-
+                    // Assumed : Equidepth histogram 
                     if (cmp < 0)
                         frac_le_v = 1.0;                /* v > all */
                     else if (cmp == 0)
@@ -648,7 +653,7 @@ static double
 cost_index_scan(double n_matching, double height)
 {
     double rows = (n_matching < 1.0) ? 1.0 : n_matching;
-
+    // Assumed the worst case where all the rows are in different pages, so we need to read one page per row, plus the height of the tree to reach the leaf level.
     return  height * random_page_cost
           + rows   * random_page_cost
           + rows   * (cpu_index_tuple_cost + cpu_tuple_cost
@@ -663,7 +668,7 @@ cost_index_creation(BlockNumber relpages)
 
     sort_log = log(pages) / log(2.0);
     if (sort_log < 1.0) sort_log = 1.0;
-
+    // Cost index creation -> read all the pages once (pages * seq_page_cost), sort them (pages * sort_log * cpu_operator_cost), and write the index pages (pages * seq_page_cost)
     return  pages * seq_page_cost
           + pages * sort_log * cpu_operator_cost
           + pages * seq_page_cost;
@@ -1132,13 +1137,13 @@ process_seqscan_node(SeqScanState *seqstate)
     relid     = RelationGetRelid(rel);
     relname   = RelationGetRelationName(rel);
     nspname   = get_namespace_name(RelationGetNamespace(rel));
-    relpages  = RelationGetNumberOfBlocks(rel);
-    reltuples = rel->rd_rel->reltuples;
-    row_size  = compute_relation_row_size(rel);
+    relpages  = RelationGetNumberOfBlocks(rel); // Number of disks blocks it takes 
+    reltuples = rel->rd_rel->reltuples; // Number of rows in the table (estimated)
+    row_size  = compute_relation_row_size(rel); // Size of row in bytes 
     avg_width = (row_size > 27)
         ? (row_size - 27) / (RelationGetNumberOfAttributes(rel) > 0
                               ? RelationGetNumberOfAttributes(rel) : 1)
-        : 8;
+        : 8; 
 
     if (reltuples <= 0) reltuples = (double) relpages * 100.0;
     if (relpages  == 0) relpages  = 1;
@@ -1150,7 +1155,7 @@ process_seqscan_node(SeqScanState *seqstate)
 
     /* enumerate existing indexes BEFORE acquiring our LWLock */
     num_existing = enumerate_existing_indexes(rel, local_existing,
-                                              MAX_EXISTING_INDEXES_PER_REL);
+                                              MAX_EXISTING_INDEXES_PER_REL); // Existsing indexes on the relation 
 
     /* ---- Classify each operator we can use ---- */
     foreach(lc, quals)
@@ -1169,12 +1174,14 @@ process_seqscan_node(SeqScanState *seqstate)
         if (n_preds >= MAX_LOCAL_PREDS)
             break;
 
+        // Ignore the function calls 
         if (!extract_simple_predicate(clause, relid,
                                       &attno, &opno, &var_left,
                                       &value, &value_type,
                                       &collation, &has_value))
             continue;
-
+        
+        // See if the opertor supported by btree
         strat = classify_btree_operator(opno);
         if (strat == OP_NONE || strat == OP_NE)
             continue;
@@ -1184,7 +1191,7 @@ process_seqscan_node(SeqScanState *seqstate)
         att = get_attname(relid, attno, true);
         if (att == NULL)
             continue;
-
+            
         preds[n_preds].attno       = attno;
         preds[n_preds].strategy    = strat;
         preds[n_preds].has_value   = has_value;
@@ -1194,6 +1201,7 @@ process_seqscan_node(SeqScanState *seqstate)
         preds[n_preds].attwidth    = get_column_avg_width(relid, attno);
         strlcpy(preds[n_preds].attname, att, NAMEDATALEN);
 
+        // Get the seelcetivft for that predicate 
         preds[n_preds].selectivity = selectivity_from_pg_stats(
             relid, attno, strat,
             value, has_value, value_type, collation);
@@ -1209,8 +1217,8 @@ process_seqscan_node(SeqScanState *seqstate)
     if (n_preds == 0)
         return;
 
-    collapse_range_pairs(preds, &n_preds);
-    sort_preds_by_attno(preds, n_preds);
+    collapse_range_pairs(preds, &n_preds); // Collapse all the range pairs 
+    sort_preds_by_attno(preds, n_preds); 
 
     /* ---- Update shared state under the lock ---- */
     LWLockAcquire(&auto_index_state->lock.lock, LW_EXCLUSIVE);
@@ -1243,6 +1251,7 @@ process_seqscan_node(SeqScanState *seqstate)
                 if (p == NULL)
                     continue;
 
+                // Update the selectivity for that predicate
                 p->avg_selectivity =
                     ((p->avg_selectivity * p->observation_count)
                      + preds[i].selectivity) / (p->observation_count + 1);
@@ -1260,7 +1269,8 @@ process_seqscan_node(SeqScanState *seqstate)
             if (n_shape > 0)
                 upsert_scan_shape(r, n_shape, shape_attnos,
                                   shape_strats, shape_sels);
-
+                
+            // Based on the updated state, see if we can propose a new index
             evaluate_and_propose(r);
         }
     }
@@ -1325,21 +1335,6 @@ cost_for_index_on_shape(AttrNumber *attnos, int ncols, RelStat *r,
     return cost_index_scan(n_match, height);
 }
 
-/*
- * Per-DML maintenance cost in PG cost units, applied once per row written.
- *
- *   per_write = cpu_index_tuple_cost
- *             + (entry_size / BLCKSZ) * random_page_cost
- *
- * cpu_index_tuple_cost covers the per-entry CPU work, and the second
- * term amortizes the leaf-page write across one btree entry of this
- * width.  Wider entries fill leaves faster -> proportionally more
- * random I/O per write.
- *
- * total_cost = creation_cost + per_write_cost * write_count
- * gives a single quantity in PG cost units that scales with the
- * actual write workload.
- */
 static double
 compute_per_write_cost(IndexCandidate *c, RelStat *r)
 {
@@ -1350,6 +1345,7 @@ compute_per_write_cost(IndexCandidate *c, RelStat *r)
 
     for (i = 0; i < c->num_cols; i++)
         entry_size += (c->attwidths[i] > 0 ? c->attwidths[i] : 8);
+
 
     return cpu_index_tuple_cost
          + ((double) entry_size / (double) BLCKSZ) * random_page_cost;
@@ -1467,6 +1463,7 @@ score_candidate(IndexCandidate *c, RelStat *r)
         double      best_existing_cost;
         double      gain;
 
+        // See of all the exisiting queries where the index helps 
         cand_cost = cost_for_index_on_shape(c->attnos, c->num_cols, r, s, height);
         if (cand_cost >= seq_cost)
             continue;                  /* candidate doesn't help this shape */
@@ -1484,7 +1481,7 @@ score_candidate(IndexCandidate *c, RelStat *r)
 
         if (cand_cost >= best_existing_cost)
             continue;                  /* an existing index already beats us */
-
+        // If the candidate porivede better than existitng index and seq scan, then add the gain to it 
         gain  = (best_existing_cost - cand_cost) * (double) s->observation_count;
         if (gain < 0.0) gain = 0.0;
         c->total_benefit += gain;
@@ -1494,7 +1491,7 @@ score_candidate(IndexCandidate *c, RelStat *r)
     c->creation_cost   = cost_index_creation(r->cached_relpages);
     c->per_write_cost  = compute_per_write_cost(c, r);
     c->total_cost      = c->creation_cost
-                       + c->per_write_cost * (double) r->write_count;
+                       + c->per_write_cost * (double) r->write_count; // Per write cost measured as the 
     c->net_benefit     = c->total_benefit - c->total_cost;
 }
 
@@ -1606,6 +1603,8 @@ evaluate_and_propose(RelStat *r)
     double         best_net = 0.0;
     bool           can_propose = !r->has_pending_request;
 
+    // First finish building all the index candidates we want to consider, so we can log them all before
+    // Because now you may not need this request at all 
     n = build_candidates(r, cands, MAX_LOCAL_CANDIDATES);
     if (n == 0)
         return;
